@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Type
+from typing import Type, Optional
 
 import imageio
 import numpy as np
@@ -46,6 +46,10 @@ class BlenderDataParserConfig(DataParserConfig):
     """How much to scale the camera origins by."""
     alpha_color: str = "white"
     """alpha color of background"""
+    tone_mapping: bool = False
+    """Whether doing tone mapping to convert HDR to sRGB"""
+    mock_split: Optional[str] = None
+    """Mock split to use another split for testing"""
 
 
 @dataclass
@@ -63,6 +67,8 @@ class Blender(DataParser):
         self.alpha_color = config.alpha_color
 
     def _generate_dataparser_outputs(self, split="train"):
+        if self.config.mock_split is not None:
+            split = self.config.mock_split
         if self.alpha_color is not None:
             alpha_color_tensor = get_color(self.alpha_color)
         else:
@@ -72,7 +78,7 @@ class Blender(DataParser):
         image_filenames = []
         poses = []
         for frame in meta["frames"]:
-            fname = self.data / Path(frame["file_path"].replace("./", "") + ".png")
+            fname = self.data / Path(frame["file_path"].replace("./", ""))
             image_filenames.append(fname)
             poses.append(np.array(frame["transform_matrix"]))
         poses = np.array(poses).astype(np.float32)
@@ -88,7 +94,9 @@ class Blender(DataParser):
 
         # in x,y,z order
         camera_to_world[..., 3] *= self.scale_factor
-        scene_box = SceneBox(aabb=torch.tensor([[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]], dtype=torch.float32))
+        scene_box = SceneBox(aabb=torch.tensor([[-self.scale_factor, -self.scale_factor, -self.scale_factor],
+                                                [self.scale_factor, self.scale_factor, self.scale_factor]],
+                                               dtype=torch.float32))
 
         cameras = Cameras(
             camera_to_worlds=camera_to_world,
@@ -105,6 +113,8 @@ class Blender(DataParser):
             alpha_color=alpha_color_tensor,
             scene_box=scene_box,
             dataparser_scale=self.scale_factor,
+            is_hdr=image_filenames[0].suffix in ['.exr', '.hdr'],
+            tone_mapping=self.config.tone_mapping,
         )
 
         return dataparser_outputs

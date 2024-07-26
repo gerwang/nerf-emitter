@@ -138,7 +138,7 @@ def run_colmap(
     ]
     if matching_method == "vocab_tree":
         vocab_tree_filename = get_vocab_tree()
-        feature_matcher_cmd.append(f"--VocabTreeMatching.vocab_tree_path {vocab_tree_filename}")
+        feature_matcher_cmd.append(f'--VocabTreeMatching.vocab_tree_path "{vocab_tree_filename}"')
     feature_matcher_cmd = " ".join(feature_matcher_cmd)
     with status(msg="[bold yellow]Running COLMAP feature matcher...", spinner="runner", verbose=verbose):
         run_command(feature_matcher_cmd, verbose=verbose)
@@ -441,7 +441,7 @@ def colmap_to_json(
             frame["mask_path"] = camera_mask_path.relative_to(camera_mask_path.parent.parent).as_posix()
         if image_id_to_depth_path is not None:
             depth_path = image_id_to_depth_path[im_id]
-            frame["depth_file_path"] = str(depth_path)
+            frame["depth_file_path"] = str(depth_path.relative_to(depth_path.parent.parent))
         frames.append(frame)
 
     if set(cam_id_to_camera.keys()) != {1}:
@@ -582,6 +582,8 @@ def create_sfm_depth(
 
         out_name = str(im_data.name)
         depth_path = output_dir / out_name
+        if depth_path.suffix == ".jpg":
+            depth_path = depth_path.with_suffix(".png")
         cv2.imwrite(str(depth_path), depth_img)  # type: ignore
 
         image_id_to_depth_path[im_id] = depth_path

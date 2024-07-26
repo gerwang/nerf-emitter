@@ -32,7 +32,8 @@ import nerfstudio.utils.math
 import nerfstudio.utils.poses as pose_utils
 from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.rays import RayBundle
-from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.data.scene_box import SceneBox, CropMode
+from nerfstudio.utils.mi_gl_conversion import batch_affine_left
 from nerfstudio.utils.tensor_dataclass import TensorDataclass
 
 TORCH_DEVICE = Union[torch.device, str]
@@ -46,6 +47,8 @@ class CameraType(Enum):
     EQUIRECTANGULAR = auto()
     OMNIDIRECTIONALSTEREO_L = auto()
     OMNIDIRECTIONALSTEREO_R = auto()
+    VR180_L = auto()
+    VR180_R = auto()
 
 
 CAMERA_MODEL_TO_TYPE = {
@@ -58,6 +61,8 @@ CAMERA_MODEL_TO_TYPE = {
     "EQUIRECTANGULAR": CameraType.EQUIRECTANGULAR,
     "OMNIDIRECTIONALSTEREO_L": CameraType.OMNIDIRECTIONALSTEREO_L,
     "OMNIDIRECTIONALSTEREO_R": CameraType.OMNIDIRECTIONALSTEREO_R,
+    "VR180_L": CameraType.VR180_L,
+    "VR180_R": CameraType.VR180_R,
 }
 
 
@@ -471,16 +476,36 @@ class Cameras(TensorDataclass):
                 tensor_aabb = tensor_aabb.to(rays_o.device)
                 shape = rays_o.shape
 
+                if aabb_box.from_world is not None:
+                    tensor_from_world = aabb_box.from_world.to(rays_o.device).expand(*shape[:-1], 4, 4)
+                    rays_o = batch_affine_left(tensor_from_world, rays_o)
+                    rays_d = batch_affine_left(tensor_from_world, rays_d, is_pos=False)
+
                 rays_o = rays_o.reshape((-1, 3))
                 rays_d = rays_d.reshape((-1, 3))
 
-                t_min, t_max = nerfstudio.utils.math.intersect_aabb(rays_o, rays_d, tensor_aabb)
+                invalid_value = 1e10
+                t_min, t_max = nerfstudio.utils.math.intersect_aabb(rays_o, rays_d, tensor_aabb,
+                                                                    invalid_value=invalid_value)
 
-                t_min = t_min.reshape([shape[0], shape[1], 1])
-                t_max = t_max.reshape([shape[0], shape[1], 1])
+                t_min = t_min.reshape([*shape[:-1], 1])
+                t_max = t_max.reshape([*shape[:-1], 1])
 
-                raybundle.nears = t_min
-                raybundle.fars = t_max
+                if aabb_box.crop_mode == CropMode.NORMAL:
+                    raybundle.nears = t_min
+                    raybundle.fars = t_max
+                elif aabb_box.crop_mode == CropMode.NEAR:
+                    raybundle.nears = torch.where(t_min != invalid_value, 0., invalid_value)
+                    raybundle.fars = t_min
+                elif aabb_box.crop_mode == CropMode.FAR:
+                    raybundle.nears = t_max
+                    raybundle.fars = torch.where(t_max != invalid_value, 1000., invalid_value)
+                elif aabb_box.crop_mode == CropMode.FAR2INF:
+                    raybundle.nears = torch.where(t_max == invalid_value, 0., t_max)
+                    raybundle.fars = torch.full_like(t_max, fill_value=1000.)
+                elif aabb_box.crop_mode == CropMode.NEAR2INF:
+                    raybundle.nears = torch.full_like(t_min, fill_value=0.)
+                    raybundle.fars = torch.where(t_min == invalid_value, 1000., t_min)
 
         # TODO: We should have to squeeze the last dimension here if we started with zero batch dims, but never have to,
         # so there might be a rogue squeeze happening somewhere, and this may cause some unintended behaviour
@@ -694,8 +719,7 @@ class Cameras(TensorDataclass):
 
             # circle of ODS ray origins
             ods_origins_circle = (
-                ods_cam_position
-                + isRightEye * (vr_ipd / 2.0) * (ods_x_axis.repeat(c2w.shape[1], 1)) * (torch.cos(ods_theta))[:, None]
+                isRightEye * (vr_ipd / 2.0) * (ods_x_axis.repeat(c2w.shape[1], 1)) * (torch.cos(ods_theta))[:, None]
                 + isRightEye * (vr_ipd / 2.0) * (ods_z_axis.repeat(c2w.shape[1], 1)) * (torch.sin(ods_theta))[:, None]
             )
 
@@ -708,6 +732,60 @@ class Cameras(TensorDataclass):
             c2w[..., :3, 3] = ods_origins_circle
 
             return ods_origins_circle, directions_stack
+
+        def _compute_rays_for_vr180(
+            eye: Literal["left", "right"]
+        ) -> Tuple[Float[Tensor, "num_rays_shape 3"], Float[Tensor, "3 num_rays_shape 3"]]:
+            """Compute the rays for a VR180 camera
+
+            Args:
+                eye: Which eye to compute rays for.
+
+            Returns:
+                A tuple containing the origins and the directions of the rays.
+            """
+            # Directions calculated similarly to equirectangular
+            vr180_cam_type = CameraType.VR180_R.value if eye == "right" else CameraType.VR180_L.value
+            mask = (self.camera_type[true_indices] == vr180_cam_type).squeeze(-1)
+            mask = torch.stack([mask, mask, mask], dim=0)
+
+            # adjusting theta range to +/-90 deg
+            theta = -torch.pi * ((x - cx) / (fx * 2))[0]
+            phi = torch.pi * (0.5 - coord_stack[..., 1])
+
+            directions_stack[..., 0][mask] = torch.masked_select(-torch.sin(theta) * torch.sin(phi), mask).float()
+            directions_stack[..., 1][mask] = torch.masked_select(torch.cos(phi), mask).float()
+            directions_stack[..., 2][mask] = torch.masked_select(-torch.cos(theta) * torch.sin(phi), mask).float()
+
+            vr_ipd = 0.064  # IPD in meters (note: scale of NeRF must be true to life and can be adjusted with the Blender add-on)
+            isRightEye = 1 if eye == "right" else -1
+
+            # find VR180 camera position
+            c2w = self.camera_to_worlds[true_indices]
+            assert c2w.shape == num_rays_shape + (3, 4)
+            transposedC2W = c2w[0][0].t()
+            vr180_cam_position = transposedC2W[3].repeat(c2w.shape[1], 1)
+
+            rotation = c2w[..., :3, :3]
+
+            -torch.pi * ((x - cx) / fx)[0]
+
+            # interocular axis of the VR180 camera
+            vr180_x_axis = torch.tensor([1, 0, 0], device=c2w.device)
+
+            # VR180 ray origins of horizontal offset
+            vr180_origins = isRightEye * (vr_ipd / 2.0) * (vr180_x_axis.repeat(c2w.shape[1], 1))
+
+            # rotate origins to match the camera rotation
+            for i in range(vr180_origins.shape[0]):
+                vr180_origins[i] = rotation[0][0] @ vr180_origins[i] + vr180_cam_position[0]
+
+            vr180_origins = vr180_origins.unsqueeze(0).repeat(c2w.shape[0], 1, 1)
+
+            # assign final camera origins
+            c2w[..., :3, 3] = vr180_origins
+
+            return vr180_origins, directions_stack
 
         for cam in cam_types:
             if CameraType.PERSPECTIVE.value in cam_types:
@@ -756,6 +834,17 @@ class Cameras(TensorDataclass):
                 ods_origins_circle, directions_stack = _compute_rays_for_omnidirectional_stereo("right")
                 # assign final camera origins
                 c2w[..., :3, 3] = ods_origins_circle
+
+            elif CameraType.VR180_L.value in cam_types:
+                vr180_origins, directions_stack = _compute_rays_for_vr180("left")
+                # assign final camera origins
+                c2w[..., :3, 3] = vr180_origins
+
+            elif CameraType.VR180_R.value in cam_types:
+                vr180_origins, directions_stack = _compute_rays_for_vr180("right")
+                # assign final camera origins
+                c2w[..., :3, 3] = vr180_origins
+
             else:
                 raise ValueError(f"Camera type {cam} not supported.")
 
@@ -859,6 +948,22 @@ class Cameras(TensorDataclass):
         K[..., 2, 2] = 1.0
         return K
 
+    def crop_output_resolution(
+            self,
+            min_x: Union[Shaped[Tensor, "*num_cameras"], Shaped[Tensor, "*num_cameras 1"], float, int],
+            min_y: Union[Shaped[Tensor, "*num_cameras"], Shaped[Tensor, "*num_cameras 1"], float, int],
+            width: Union[Shaped[Tensor, "*num_cameras"], Shaped[Tensor, "*num_cameras 1"], float, int],
+            height: Union[Shaped[Tensor, "*num_cameras"], Shaped[Tensor, "*num_cameras 1"], float, int],
+    ) -> None:
+        min_x = self.broadcast_params(min_x)
+        min_y = self.broadcast_params(min_y)
+        width = self.broadcast_params(width)
+        height = self.broadcast_params(height)
+        self.cx = self.cx - min_x
+        self.cy = self.cy - min_y
+        self.width = width.round().to(torch.int64)
+        self.height = height.round().to(torch.int64)
+
     def rescale_output_resolution(
         self, scaling_factor: Union[Shaped[Tensor, "*num_cameras"], Shaped[Tensor, "*num_cameras 1"], float, int]
     ) -> None:
@@ -867,20 +972,24 @@ class Cameras(TensorDataclass):
         Args:
             scaling_factor: Scaling factor to apply to the output resolution.
         """
-        if isinstance(scaling_factor, (float, int)):
-            scaling_factor = torch.tensor([scaling_factor]).to(self.device).broadcast_to((self.cx.shape))
-        elif isinstance(scaling_factor, torch.Tensor) and scaling_factor.shape == self.shape:
-            scaling_factor = scaling_factor.unsqueeze(-1)
-        elif isinstance(scaling_factor, torch.Tensor) and scaling_factor.shape == (*self.shape, 1):
-            pass
-        else:
-            raise ValueError(
-                f"Scaling factor must be a float, int, or a tensor of shape {self.shape} or {(*self.shape, 1)}."
-            )
+        scaling_factor = self.broadcast_params(scaling_factor)
 
         self.fx = self.fx * scaling_factor
         self.fy = self.fy * scaling_factor
         self.cx = self.cx * scaling_factor
         self.cy = self.cy * scaling_factor
-        self.height = (self.height * scaling_factor).to(torch.int64)
-        self.width = (self.width * scaling_factor).to(torch.int64)
+        self.height = (self.height * scaling_factor).round().to(torch.int64)
+        self.width = (self.width * scaling_factor).round().to(torch.int64)
+
+    def broadcast_params(self, x):
+        if isinstance(x, (float, int)):
+            x = torch.tensor([x]).to(self.device).broadcast_to(self.cx.shape)
+        elif isinstance(x, torch.Tensor) and x.shape == self.shape:
+            x = x.unsqueeze(-1)
+        elif isinstance(x, torch.Tensor) and x.shape == (*self.shape, 1):
+            pass
+        else:
+            raise ValueError(
+                f"Scaling factor must be a float, int, or a tensor of shape {self.shape} or {(*self.shape, 1)}."
+            )
+        return x

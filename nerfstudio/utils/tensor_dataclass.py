@@ -333,6 +333,8 @@ class TensorDataclass:
                     new_dict[f] = fn(v)
                 elif isinstance(v, Dict):
                     new_dict[f] = self._apply_fn_to_dict(v, fn, dataclass_fn)
+                elif isinstance(v, Callable):
+                    new_dict[f] = v
                 else:
                     new_dict[f] = deepcopy(v)
 

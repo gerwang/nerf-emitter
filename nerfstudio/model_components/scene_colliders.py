@@ -108,6 +108,41 @@ class AABBBoxCollider(SceneCollider):
         return ray_bundle
 
 
+class AABBBoxIntersectCollider(AABBBoxCollider):
+    """If near and far are already set, they should be intersected"""
+
+    def forward(self, ray_bundle: RayBundle) -> RayBundle:
+        """Sets the nears and fars if they are not set already."""
+        old_nears = ray_bundle.nears
+        old_fars = ray_bundle.fars
+        ray_bundle = self.set_nears_and_fars(ray_bundle)
+        if old_nears is not None:
+            ray_bundle.nears = torch.maximum(ray_bundle.nears, old_nears)
+        if old_fars is not None:
+            ray_bundle.fars = torch.minimum(ray_bundle.fars, old_fars)
+        return ray_bundle
+
+
+class AABBBoxFarIntersectCollider(AABBBoxCollider):
+    """Intersect the space outside the aabb"""
+
+    def forward(self, ray_bundle: RayBundle) -> RayBundle:
+        """Sets the nears and fars if they are not set already."""
+        old_nears = ray_bundle.nears
+        old_fars = ray_bundle.fars
+        ray_bundle = self.set_nears_and_fars(ray_bundle)
+        new_fars = ray_bundle.fars
+        if old_nears is not None:
+            ray_bundle.nears = torch.maximum(old_nears, new_fars)
+        else:
+            ray_bundle.nears = new_fars
+        if old_fars is not None:
+            ray_bundle.fars = old_fars
+        else:
+            ray_bundle.fars = torch.full_like(new_fars, fill_value=1000.)
+        return ray_bundle
+
+
 def _intersect_with_sphere(
     rays_o: torch.Tensor, rays_d: torch.Tensor, center: torch.Tensor, radius: float = 1.0, near_plane: float = 0.0
 ):

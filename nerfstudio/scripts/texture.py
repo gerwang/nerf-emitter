@@ -66,7 +66,7 @@ class TextureMesh:
         # and a material and texture file
         texture_utils.export_textured_mesh(
             mesh=mesh,
-            pipeline=pipeline,
+            pipeline_or_volume_dict=pipeline,
             output_dir=self.output_dir,
             px_per_uv_triangle=self.px_per_uv_triangle,
             unwrap_method=self.unwrap_method,

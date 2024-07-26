@@ -16,8 +16,14 @@
 Script for exporting NeRF into other formats.
 """
 
-
 from __future__ import annotations
+
+import mitsuba as mi
+from util import atleast_4d
+
+mi.set_variant('cuda_ad_rgb')
+from constants import SDF_DEFAULT_KEY
+from shapes import Grid3d
 
 import json
 import os
@@ -55,7 +61,7 @@ class Exporter:
 
     load_config: Path
     """Path to the config YAML file."""
-    output_dir: Path
+    output_dir: Optional[Path] = None
     """Path to the output directory."""
 
 
@@ -97,6 +103,8 @@ class ExportPointCloud(Exporter):
     """Number of points to generate. May result in less if outlier removal is used."""
     remove_outliers: bool = True
     """Remove outliers from the point cloud."""
+    reorient_normals: bool = True
+    """Reorient point cloud normals based on view direction."""
     normal_method: Literal["open3d", "model_output"] = "model_output"
     """Method to estimate normals with."""
     normal_output_name: str = "normals"
@@ -138,6 +146,7 @@ class ExportPointCloud(Exporter):
             pipeline=pipeline,
             num_points=self.num_points,
             remove_outliers=self.remove_outliers,
+            reorient_normals=self.reorient_normals,
             estimate_normals=estimate_normals,
             rgb_output_name=self.rgb_output_name,
             depth_output_name=self.depth_output_name,
@@ -243,6 +252,8 @@ class ExportPoissonMesh(Exporter):
     """Number of points to generate. May result in less if outlier removal is used."""
     remove_outliers: bool = True
     """Remove outliers from the point cloud."""
+    reorient_normals: bool = True
+    """Reorient point cloud normals based on view direction."""
     depth_output_name: str = "depth"
     """Name of the depth output."""
     rgb_output_name: str = "rgb"
@@ -296,6 +307,7 @@ class ExportPoissonMesh(Exporter):
             pipeline=pipeline,
             num_points=self.num_points,
             remove_outliers=self.remove_outliers,
+            reorient_normals=self.reorient_normals,
             estimate_normals=estimate_normals,
             rgb_output_name=self.rgb_output_name,
             depth_output_name=self.depth_output_name,
@@ -440,6 +452,136 @@ class ExportCameraPoses(Exporter):
             CONSOLE.print(f"[bold green]:white_check_mark: Saved poses to {output_file_path}")
 
 
+@dataclass
+class ExportMitsubaMarchingCubesMesh(ExportMarchingCubesMesh):
+    """
+    Export a Mitsuba SDF to mesh using marching cubes.
+    """
+
+    shape_only: bool = False
+    """Only extract shape to save time"""
+    resolution: int = 512
+    """Marching cube resolution."""
+    bounding_box_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Override minimum of the bounding box."""
+    save_voxel_path: Optional[Path] = None
+    """Save voxel to the specific path"""
+    load_iter: str = 'final'
+
+    @staticmethod
+    def create_volume(data=None, filename=None) -> mi.Volume:
+        res = {
+            'type': 'gridvolume',
+        }
+        if data is not None:
+            res.update({
+                'grid': mi.VolumeGrid(data),
+            })
+        if filename is not None:
+            res.update({
+                'filename': str(filename)
+            })
+        return mi.load_dict(res)
+
+    @staticmethod
+    def get_default_red_volume():
+        return mi.load_dict({
+            'type': 'gridvolume',
+            'filename': './differentiable-sdf-rendering/assets/textures/red.vol',
+        })
+
+    def main(self) -> None:
+        """Export camera poses"""
+        if self.output_dir is None:
+            self.output_dir = self.load_config.parent / 'mi_mesh'
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        if self.load_config.is_dir():
+            filenames = [x for x in os.listdir(self.load_config) if x.endswith(f'-{self.load_iter}.vol')]
+            sdf_keys = [x for x in filenames if 'sdf-data' in x]
+            reflectance_keys = [x for x in filenames if 'reflectance' in x or 'base_color' in x]
+            roughness_keys = [x for x in filenames if 'roughness' in x]
+            sdf = Grid3d(atleast_4d(mi.TensorXf(np.asarray(mi.VolumeGrid(str(self.load_config / sdf_keys[0]))))))
+            reflectance = self.create_volume(filename=self.load_config / reflectance_keys[0]) if len(
+                reflectance_keys) > 0 else self.get_default_red_volume()
+            roughness = self.create_volume(filename=self.load_config / roughness_keys[0]) if len(
+                roughness_keys) > 0 else None
+        else:
+            _, pipeline, _, _ = eval_setup(self.load_config)
+            assert hasattr(pipeline, "sdf_scene"), "Pipeline must have a Mitsuba sdf_scene."
+            params = pipeline.opt
+            sdf = Grid3d(params[SDF_DEFAULT_KEY])
+            reflectance_keys = [k for k in params.keys() if 'reflectance' in k or 'base_color' in k]
+            reflectance = self.create_volume(data=params[reflectance_keys[0]]) if len(
+                reflectance_keys) > 0 else self.get_default_red_volume()
+            roughness_keys = [k for k in params.keys() if 'roughness' in k]
+            roughness = self.create_volume(data=params[roughness_keys[0]]) if len(roughness_keys) > 0 else None
+
+        CONSOLE.print("Extracting Mitsuba SDF to a mesh with marching cubes... which may take a while")
+
+        assert (
+                self.resolution % 512 == 0
+        ), f"""resolution must be divisible by 512, got {self.resolution}.
+        This is important because the algorithm uses a multi-resolution approach
+        to evaluate the SDF where the minimum resolution is 512."""
+
+        def sdf_fn(x: torch.Tensor):
+            return sdf.eval(mi.Point3f(x)).torch()
+
+        # Extract mesh using marching cubes for sdf at a multi-scale resolution.
+        multi_res_mesh = generate_mesh_with_multires_marching_cubes(
+            geometry_callable_field=sdf_fn,
+            resolution=self.resolution,
+            bounding_box_min=self.bounding_box_min,
+            bounding_box_max=self.bounding_box_max,
+            isosurface_threshold=self.isosurface_threshold,
+            coarse_mask=None,
+        )
+        filename = self.output_dir / "sdf_marching_cubes_mesh.ply"
+        multi_res_mesh.export(filename)
+
+        if self.save_voxel_path:
+            self.save_voxel_path.mkdir(parents=True, exist_ok=True)
+            mi.VolumeGrid(sdf.texture.tensor()).write(str(self.save_voxel_path / 'sdf-data-.vol'))
+            reflectance_name = None
+            roughness_name = None
+            if len(reflectance_keys) > 0:
+                if len(roughness_keys) > 0:
+                    reflectance_name = 'principled-bsdf-base_color-volume-data-.vol'
+                    roughness_name = 'principled-bsdf-roughness-volume-data-.vol'
+                else:
+                    reflectance_name = 'diffuse-bsdf-reflectance-volume-data-.vol'
+            if reflectance_name is not None:
+                mi.VolumeGrid(mi.traverse(reflectance)['data']).write(
+                    str(self.save_voxel_path / reflectance_name))
+            if roughness_name is not None:
+                mi.VolumeGrid(mi.traverse(roughness)['data']).write(
+                    str(self.save_voxel_path / roughness_name))
+
+        if self.shape_only:
+            return
+
+        # load the mesh from the marching cubes export
+        mesh = get_mesh_from_filename(str(filename), target_num_faces=self.target_num_faces)
+        volume_dict = {}
+        if reflectance is not None:
+            volume_dict['reflectance'] = reflectance
+        if roughness is not None:
+            volume_dict['roughness'] = roughness
+
+        CONSOLE.print("Texturing mesh with Mitsuba volumes...")
+        texture_utils.export_textured_mesh(
+            mesh,
+            volume_dict,
+            self.output_dir,
+            px_per_uv_triangle=self.px_per_uv_triangle if self.unwrap_method == "custom" else None,
+            unwrap_method=self.unwrap_method,
+            num_pixels_per_side=self.num_pixels_per_side,
+            write_normals=False,  # if we want to re-render in Mitsuba, it does not support vertex normals
+        )
+
+
 Commands = tyro.conf.FlagConversionOff[
     Union[
         Annotated[ExportPointCloud, tyro.conf.subcommand(name="pointcloud")],
@@ -447,6 +589,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[ExportPoissonMesh, tyro.conf.subcommand(name="poisson")],
         Annotated[ExportMarchingCubesMesh, tyro.conf.subcommand(name="marching-cubes")],
         Annotated[ExportCameraPoses, tyro.conf.subcommand(name="cameras")],
+        Annotated[ExportMitsubaMarchingCubesMesh, tyro.conf.subcommand(name="mi-marching-cubes")],
     ]
 ]
 

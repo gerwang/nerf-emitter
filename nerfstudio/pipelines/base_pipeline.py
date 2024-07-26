@@ -20,9 +20,12 @@ from __future__ import annotations
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Type, Union, cast
 
+import imageio.v3 as iio
+import numpy as np
 import torch
 import torch.distributed as dist
 from rich.progress import (
@@ -33,17 +36,20 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from torch import nn
+from torch.cuda.amp.grad_scaler import GradScaler
 from torch.nn import Parameter
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp.grad_scaler import GradScaler
 
+from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.configs import base_config as cfg
 from nerfstudio.data.datamanagers.base_datamanager import (
     DataManager,
     DataManagerConfig,
     VanillaDataManager,
 )
+from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
+from nerfstudio.model_components import renderers
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import profiler
 
@@ -93,6 +99,10 @@ class Pipeline(nn.Module):
     datamanager: DataManager
     _model: Model
     world_size: int
+    trainer: Optional['Trainer']
+
+    def set_trainer(self, trainer: 'Trainer'):
+        self.trainer = trainer
 
     @property
     def model(self):
@@ -104,7 +114,49 @@ class Pipeline(nn.Module):
         """Returns the device that the model is on."""
         return self.model.device
 
-    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True):
+    def takeover_backward(self, step):
+        return False
+
+    def mi_opt_step(self, step):
+        """
+        Step a Mitsuba optimizer, if any
+        """
+        return
+
+    def render_camera_outputs(self, cameras, camera_idx, crop_data=None):
+        aabb_box = None
+        if crop_data is not None:
+            bounding_box_min = crop_data.center - crop_data.scale / 2.0
+            bounding_box_max = crop_data.center + crop_data.scale / 2.0
+            aabb_box = SceneBox(
+                torch.stack([bounding_box_min, bounding_box_max]).to(self.device),
+                crop_data.crop_mode,
+            )
+            rotater = getattr(self.datamanager, 'rotater', None)
+            if rotater is not None:
+                rotater.apply_scene_box(aabb_box, torch.tensor([camera_idx]))
+        camera_opt_to_camera = self.datamanager.train_camera_optimizer(torch.tensor([camera_idx]))
+        camera_ray_bundle = cameras.generate_rays(camera_indices=camera_idx, aabb_box=aabb_box,
+                                                  camera_opt_to_camera=camera_opt_to_camera)
+        if self.datamanager.rotater is not None:
+            camera_ray_bundle.rotater = self.datamanager.rotater.apply_frustums
+        if crop_data is not None:
+            with renderers.background_color_override_context(
+                    crop_data.background_color.to(self.device)
+            ), torch.no_grad():
+                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+        else:
+            with torch.no_grad():
+                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+        return outputs
+
+    @abstractmethod
+    def render_forward_gradient(self, cameras, camera_idx, axis, spp, spp_per_batch, target_value):
+        """
+        Render mitsuba forward gradient image
+        """
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: Optional[bool] = None):
         is_ddp_model_state = True
         model_state = {}
         for key, value in state_dict.items():
@@ -120,7 +172,15 @@ class Pipeline(nn.Module):
             model_state = {key[len("module.") :]: value for key, value in model_state.items()}
 
         pipeline_state = {key: value for key, value in state_dict.items() if not key.startswith("_model.")}
-        self.model.load_state_dict(model_state, strict=strict)
+
+        try:
+            self.model.load_state_dict(model_state, strict=True)
+        except RuntimeError:
+            if not strict:
+                self.model.load_state_dict(model_state, strict=False)
+            else:
+                raise
+
         super().load_state_dict(pipeline_state, strict=False)
 
     @profiler.time_function
@@ -173,8 +233,16 @@ class Pipeline(nn.Module):
 
     @abstractmethod
     @profiler.time_function
-    def get_average_eval_image_metrics(self, step: Optional[int] = None):
-        """Iterate over all the images in the eval dataset and get the average."""
+    def get_average_eval_image_metrics(
+        self, step: Optional[int] = None, output_path: Optional[Path] = None, get_std: bool = False
+    ):
+        """Iterate over all the images in the eval dataset and get the average.
+
+        Args:
+            step: current training step
+            output_path: optional path to save rendered images to
+            get_std: Set True if you want to return std with the mean metric.
+        """
 
     def load_pipeline(self, loaded_state: Dict[str, Any], step: int) -> None:
         """Load the checkpoint from the given path
@@ -197,6 +265,27 @@ class Pipeline(nn.Module):
         Returns:
             A list of dictionaries containing the pipeline's param groups.
         """
+
+    @abstractmethod
+    def backward_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, grad_out: torch.Tensor) -> None:
+        """Takes in camera parameters and computes the output of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+            grad_out: gradients of the output rgb
+        """
+
+    @abstractmethod
+    def set_light_axis_angle(self, axis: List[float], angle: float) -> None:
+        """Set environment light's rotation by axis angle to support relighting.
+
+        Args:
+            axis: rotation axis
+            angle: rotation angle, in degrees
+        """
+
+    def should_build_emitter_proposal(self) -> bool:
+        return False
 
 
 @dataclass
@@ -238,6 +327,7 @@ class VanillaPipeline(Pipeline):
         world_size: int = 1,
         local_rank: int = 0,
         grad_scaler: Optional[GradScaler] = None,
+        mixed_precision: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -245,6 +335,7 @@ class VanillaPipeline(Pipeline):
         self.datamanager: DataManager = config.datamanager.setup(
             device=device, test_mode=test_mode, world_size=world_size, local_rank=local_rank
         )
+        self.datamanager.load_checkpoint()
         self.datamanager.to(device)
         # TODO(ethan): get rid of scene_bounds from the model
         assert self.datamanager.train_dataset is not None, "Missing input dataset"
@@ -255,6 +346,8 @@ class VanillaPipeline(Pipeline):
             metadata=self.datamanager.train_dataset.metadata,
             device=device,
             grad_scaler=grad_scaler,
+            mixed_precision=mixed_precision,
+            rotater=getattr(self.datamanager, 'rotater', None),
         )
         self.model.to(device)
 
@@ -269,13 +362,14 @@ class VanillaPipeline(Pipeline):
         return self.model.device
 
     @profiler.time_function
-    def get_train_loss_dict(self, step: int):
+    def get_train_loss_dict(self, step: int, model_output_dir: Path | None = None):
         """This function gets your training loss dict. This will be responsible for
         getting the next batch of data from the DataManager and interfacing with the
         Model class, feeding the data to the model's forward function.
 
         Args:
             step: current iteration step to update sampler if using DDP (distributed)
+            model_output_dir: directory to write mitsuba output images
         """
         ray_bundle, batch = self.datamanager.next_train(step)
         model_outputs = self._model(ray_bundle)  # train distributed data parallel model if world_size > 1
@@ -339,8 +433,15 @@ class VanillaPipeline(Pipeline):
         return metrics_dict, images_dict
 
     @profiler.time_function
-    def get_average_eval_image_metrics(self, step: Optional[int] = None):
+    def get_average_eval_image_metrics(
+        self, step: Optional[int] = None, output_path: Optional[Path] = None, get_std: bool = False
+    ):
         """Iterate over all the images in the eval dataset and get the average.
+
+        Args:
+            step: current training step
+            output_path: optional path to save rendered images to
+            get_std: Set True if you want to return std with the mean metric.
 
         Returns:
             metrics_dict: dictionary of metrics
@@ -357,13 +458,26 @@ class VanillaPipeline(Pipeline):
             transient=True,
         ) as progress:
             task = progress.add_task("[green]Evaluating all eval images...", total=num_images)
+            eval_cameras = self.datamanager.eval_dataset.cameras.to(self.device)
             for camera_ray_bundle, batch in self.datamanager.fixed_indices_eval_dataloader:
                 # time this the following line
                 inner_start = time()
                 height, width = camera_ray_bundle.shape
                 num_rays = height * width
-                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
-                metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
+                outputs = self.render_camera_outputs(eval_cameras, batch['image_idx'])
+                metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+
+                def imwrite(image_path, x):
+                    if x.dtype in [np.float32, np.float64]:
+                        x = (x * 255).astype(np.uint8)
+                    iio.imwrite(image_path, x)
+
+                if output_path is not None:
+                    camera_indices = camera_ray_bundle.camera_indices
+                    assert camera_indices is not None
+                    for key, val in images_dict.items():
+                        imwrite(output_path / "{0:06d}-{1}.png".format(int(camera_indices[0, 0, 0]), key),
+                                    val.cpu().numpy())
                 assert "num_rays_per_sec" not in metrics_dict
                 metrics_dict["num_rays_per_sec"] = num_rays / (time() - inner_start)
                 fps_str = "fps"
@@ -374,9 +488,16 @@ class VanillaPipeline(Pipeline):
         # average the metrics list
         metrics_dict = {}
         for key in metrics_dict_list[0].keys():
-            metrics_dict[key] = float(
-                torch.mean(torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list]))
-            )
+            if get_std:
+                key_std, key_mean = torch.std_mean(
+                    torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list])
+                )
+                metrics_dict[key] = float(key_mean)
+                metrics_dict[f"{key}_std"] = float(key_std)
+            else:
+                metrics_dict[key] = float(
+                    torch.mean(torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list]))
+                )
         self.train()
         return metrics_dict
 
@@ -391,7 +512,7 @@ class VanillaPipeline(Pipeline):
             (key[len("module.") :] if key.startswith("module.") else key): value for key, value in loaded_state.items()
         }
         self.model.update_to_step(step)
-        self.load_state_dict(state, strict=True)
+        self.load_state_dict(state)
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes

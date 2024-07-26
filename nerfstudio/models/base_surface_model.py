@@ -25,8 +25,8 @@ from typing import Any, Dict, List, Literal, Tuple, Type, cast
 import torch
 import torch.nn.functional as F
 from torch.nn import Parameter
-from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.functional import structural_similarity_index_measure
+from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from nerfstudio.cameras.rays import RayBundle
@@ -72,7 +72,7 @@ class SurfaceModelConfig(ModelConfig):
     use_average_appearance_embedding: bool = False
     """Whether to use average appearance embedding or zeros for inference."""
     eikonal_loss_mult: float = 0.1
-    """Monocular normal consistency loss multiplier."""
+    """Eikonal loss multiplier."""
     fg_mask_loss_mult: float = 0.01
     """Foreground mask loss multiplier."""
     mono_normal_loss_mult: float = 0.0
@@ -89,6 +89,8 @@ class SurfaceModelConfig(ModelConfig):
     """Total variational loss multiplier"""
     overwrite_near_far_plane: bool = False
     """whether to use near and far collider from command line"""
+    scene_contraction_norm: Literal["inf", "l2"] = "inf"
+    """Which norm to use for the scene contraction."""
 
 
 class SurfaceModel(Model):
@@ -104,8 +106,14 @@ class SurfaceModel(Model):
         """Set the fields and modules."""
         super().populate_modules()
 
-        self.scene_contraction = SceneContraction(order=float("inf"))
+        if self.config.scene_contraction_norm == "inf":
+            order = float("inf")
+        elif self.config.scene_contraction_norm == "l2":
+            order = None
+        else:
+            raise ValueError("Invalid scene contraction norm")
 
+        self.scene_contraction = SceneContraction(order=order)
         # Can we also use contraction for sdf?
         # Fields
         self.field = self.config.sdf_field.setup(
@@ -243,7 +251,7 @@ class SurfaceModel(Model):
             depth_bg = self.renderer_depth(weights=weights_bg, ray_samples=ray_samples_bg)
             accumulation_bg = self.renderer_accumulation(weights=weights_bg)
 
-            # merge background color to foregound color
+            # merge background color to foreground color
             rgb = rgb + bg_transmittance * rgb_bg
 
             bg_outputs = {
@@ -293,7 +301,12 @@ class SurfaceModel(Model):
         """
         loss_dict = {}
         image = batch["image"].to(self.device)
-        loss_dict["rgb_loss"] = self.rgb_loss(image, outputs["rgb"])
+        pred_image, image = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb"],
+            pred_accumulation=outputs["accumulation"],
+            gt_image=image,
+        )
+        loss_dict["rgb_loss"] = self.rgb_loss(image, pred_image)
         if self.training:
             # eikonal loss
             grad_theta = outputs["eik_grad"]
@@ -337,6 +350,7 @@ class SurfaceModel(Model):
         """
         metrics_dict = {}
         image = batch["image"].to(self.device)
+        image = self.renderer_rgb.blend_background(image)
         metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
         return metrics_dict
 
@@ -352,6 +366,7 @@ class SurfaceModel(Model):
             A dictionary of metrics.
         """
         image = batch["image"].to(self.device)
+        image = self.renderer_rgb.blend_background(image)
         rgb = outputs["rgb"]
         acc = colormaps.apply_colormap(outputs["accumulation"])
 

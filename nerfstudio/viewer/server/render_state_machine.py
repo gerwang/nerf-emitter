@@ -128,6 +128,11 @@ class RenderStateMachine(threading.Thread):
 
         with self.viewer.train_lock if self.viewer.train_lock is not None else contextlib.nullcontext():
             camera_ray_bundle = camera.generate_rays(camera_indices=0, aabb_box=self.viewer.get_model().render_aabb)
+            rotater = self.viewer.get_rotater()
+            if rotater is not None:
+                camera_idx = rotater.map_rotation_option_to_camera_idx(self.viewer.control_panel.rotation_option)
+                camera_ray_bundle.set_camera_indices(camera_idx)
+                camera_ray_bundle.rotater = rotater.apply_frustums
 
             with TimeWriter(None, None, write=False) as vis_t:
                 self.viewer.get_model().eval()
@@ -201,6 +206,8 @@ class RenderStateMachine(threading.Thread):
             self.viewer.viser_server.send_output_options_message(list(outputs.keys()))
             self.viewer.control_panel.update_output_options(list(outputs.keys()))
 
+        self.viewer.update_rotation_options()
+
         output_render = self.viewer.control_panel.output_render
         self.viewer.update_colormap_options(
             dimensions=outputs[output_render].shape[-1], dtype=outputs[output_render].dtype
@@ -243,6 +250,8 @@ class RenderStateMachine(threading.Thread):
             image_height: the maximum image height that can be rendered in the time budget
             image_width: the maximum image width that can be rendered in the time budget
         """
+        if aspect_ratio == 0:
+            aspect_ratio = 0.001
         max_res = self.viewer.control_panel.max_res
         if self.state == "high":
             # high res is always static

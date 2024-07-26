@@ -17,11 +17,24 @@ Dataset input structures.
 """
 
 from dataclasses import dataclass
-from typing import Union
+from enum import Enum, auto
+from typing import Union, Optional
 
 import torch
-from jaxtyping import Float
+from jaxtyping import Float, Bool
 from torch import Tensor
+
+
+class CropMode(Enum):
+    NEAR = auto()
+    NORMAL = auto()
+    FAR = auto()
+    FAR2INF = auto()
+    NEAR2INF = auto()
+
+
+def aabb_contain(aabb: Float[Tensor, "2 3"], positions: Float[Tensor, "*batch 3"]) -> Bool[Tensor, "*batch"]:
+    return torch.all(positions > aabb[0], dim=-1) & torch.all(positions < aabb[1], dim=-1)
 
 
 @dataclass
@@ -32,6 +45,11 @@ class SceneBox:
     """aabb: axis-aligned bounding box.
     aabb[0] is the minimum (x,y,z) point.
     aabb[1] is the maximum (x,y,z) point."""
+    crop_mode: CropMode = CropMode.NORMAL
+    """Which segment to retain, before aabb, inside aabb or beyond aabb"""
+    from_world: Optional[Union[Float[Tensor, "*batch 3 4"], Float[Tensor, "*batch 4 4"]]] = None
+    """from_world: transformation from the observation space to the canonical space when the box is axis-aligned
+    Note: cannot have scale component or the near far plane would be incorrect"""
 
     def get_diagonal_length(self):
         """Returns the longest diagonal length."""
@@ -52,6 +70,10 @@ class SceneBox:
             scale_factor: How much to scale the camera origins by.
         """
         return SceneBox(aabb=(self.aabb - self.get_center()) * scale_factor)
+
+    def contains(self, positions: Float[Tensor, "*batch 3"]) -> Bool[Tensor, "*batch"]:
+        aabb = self.aabb.to(positions.device)
+        return aabb_contain(aabb, positions)
 
     @staticmethod
     def get_normalized_positions(positions: Float[Tensor, "*batch 3"], aabb: Float[Tensor, "2 3"]):

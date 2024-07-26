@@ -19,12 +19,14 @@ Code for camera paths.
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import numpy as np
 
 import nerfstudio.utils.poses as pose_utils
 from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.camera_utils import get_interpolated_poses_many
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.viewer.server.utils import three_js_perspective_camera_focal_length
+from scipy.spatial.transform.rotation import Rotation as R
 
 
 def get_interpolated_camera_path(cameras: Cameras, steps: int, order_poses: bool) -> Cameras:
@@ -120,6 +122,104 @@ def get_spiral_path(
     )
 
 
+def look_at(origin, target, up):
+    """
+    Generates a 4x4 transformation matrix that transforms points from a
+    coordinate system defined by the origin, target, and up vectors to
+    the world coordinate system.
+
+    Args:
+        origin (numpy.ndarray): A 1D array of length 3 representing the
+            position of the camera in the world coordinate system.
+        target (numpy.ndarray): A 1D array of length 3 representing the
+            position that the camera is looking at in the world coordinate
+            system.
+        up (numpy.ndarray): A 1D array of length 3 representing the up
+            direction of the camera in the world coordinate system.
+
+    Returns:
+        numpy.ndarray: A 4x4 transformation matrix.
+    """
+    # Compute the forward direction of the camera.
+    forward = (target - origin) / np.linalg.norm(target - origin)
+
+    # Compute the right direction of the camera.
+    right = np.cross(forward, up)
+    right /= np.linalg.norm(right)
+
+    # Compute the up direction of the camera.
+    new_up = np.cross(right, forward)
+
+    # Construct a 4x4 transformation matrix.
+    transformation = np.eye(4)
+    transformation[:3, 0] = right
+    transformation[:3, 1] = new_up
+    transformation[:3, 2] = -forward
+    transformation[:3, 3] = origin
+
+    return transformation
+
+
+def pose_to_euler_radius(pose):
+    rot = pose[:3, :3]
+    trans = pose[:3, 3]
+    direction = rot @ np.array([0, 0, 1])
+    t = -trans[2] / direction[2]
+    center = trans + t * direction
+    euler_angle = R.from_matrix(rot).as_euler('xyz', degrees=True)
+    radius = np.linalg.norm(trans - center)
+    return euler_angle, radius, center
+
+
+def euler_radius_to_pose(euler_angle, radius, center):
+    rot = R.from_euler('xyz', euler_angle, degrees=True).as_matrix()
+    trans = rot @ np.array([0, 0, radius]) + center
+    ret = np.eye(4)
+    ret[:3, :3] = rot
+    ret[:3, 3] = trans
+    return ret
+
+
+def get_blender_test_path(
+        camera: Cameras,
+        num_views=360,
+        phi_min=45,
+        phi_max=135,
+        cur_phi_dir=1,
+        cur_theta_dir=1,
+):
+    euler_angle, radius, center = pose_to_euler_radius(camera.camera_to_worlds[0].cpu().numpy())
+    theta_step = 360 * 3 / num_views
+    euler_angle[0] = min(max(euler_angle[0], phi_min), phi_max)
+    # phi_min = min(phi_min, euler_angle[0])
+    # phi_max = max(phi_max, euler_angle[0])
+    phi_step = 2 * (phi_max - phi_min) / num_views
+    c2ws_np = []
+    for i in range(num_views):
+        c2ws_np.append(euler_radius_to_pose(euler_angle, radius, center)[:3])
+        euler_angle[0] += phi_step * cur_phi_dir
+        euler_angle[2] += theta_step * cur_theta_dir
+        if euler_angle[0] >= phi_max:
+            euler_angle[0] = phi_max
+            cur_phi_dir *= -1
+        elif euler_angle[0] <= phi_min:
+            euler_angle[0] = phi_min
+            cur_phi_dir *= -1
+    c2ws_np = np.stack(c2ws_np)
+    c2ws = torch.from_numpy(c2ws_np).float().to(camera.device)
+    times = None
+    if camera.times is not None:
+        times = torch.linspace(0, 1, num_views)[:, None]
+    return Cameras(
+        fx=camera.fx[0],
+        fy=camera.fy[0],
+        cx=camera.cx[0],
+        cy=camera.cy[0],
+        camera_to_worlds=c2ws,
+        times=times
+    )
+
+
 def get_path_from_json(camera_path: Dict[str, Any]) -> Cameras:
     """Takes a camera path dictionary and returns a trajectory as a Camera instance.
 
@@ -141,6 +241,8 @@ def get_path_from_json(camera_path: Dict[str, Any]) -> Cameras:
         camera_type = CameraType.EQUIRECTANGULAR
     elif camera_path["camera_type"].lower() == "omnidirectional":
         camera_type = CameraType.OMNIDIRECTIONALSTEREO_L
+    elif camera_path["camera_type"].lower() == "vr180":
+        camera_type = CameraType.VR180_L
     else:
         camera_type = CameraType.PERSPECTIVE
 
@@ -151,11 +253,13 @@ def get_path_from_json(camera_path: Dict[str, Any]) -> Cameras:
         # pose
         c2w = torch.tensor(camera["camera_to_world"]).view(4, 4)[:3]
         c2ws.append(c2w)
-        if (
-            camera_type == CameraType.EQUIRECTANGULAR
-            or camera_type == CameraType.OMNIDIRECTIONALSTEREO_L
-            or camera_type == CameraType.OMNIDIRECTIONALSTEREO_R
-        ):
+        if camera_type in [
+            CameraType.EQUIRECTANGULAR,
+            CameraType.OMNIDIRECTIONALSTEREO_L,
+            CameraType.OMNIDIRECTIONALSTEREO_R,
+            CameraType.VR180_L,
+            CameraType.VR180_R,
+        ]:
             fxs.append(image_width / 2)
             fys.append(image_height)
         else:

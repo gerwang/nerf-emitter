@@ -45,6 +45,8 @@ subcommand:
 
 from __future__ import annotations
 
+import mitsuba as mi
+mi.set_variant('cuda_ad_rgb') # TODO set variant while respecting LLVM variant
 import random
 import socket
 import traceback

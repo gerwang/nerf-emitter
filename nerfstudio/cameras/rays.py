@@ -209,6 +209,8 @@ class RayBundle(TensorDataclass):
     """Additional metadata or data needed for interpolation, will mimic shape of rays"""
     times: Optional[Float[Tensor, "*batch 1"]] = None
     """Times at which rays are sampled"""
+    rotater: Optional[Callable[[Frustums, torch.Tensor], None]] = None
+    """Rotater function that distorts a bounding sphere"""
 
     def set_camera_indices(self, camera_index: int) -> None:
         """Sets all the camera indices to a specific camera index.
@@ -280,6 +282,8 @@ class RayBundle(TensorDataclass):
             ends=bin_ends,  # [..., num_samples, 1]
             pixel_area=shaped_raybundle_fields.pixel_area,  # [..., 1, 1]
         )
+        if self.rotater is not None:
+            self.rotater(frustums, camera_indices)
 
         ray_samples = RaySamples(
             frustums=frustums,

@@ -32,7 +32,9 @@ from nerfstudio.configs.base_config import InstantiateConfig
 from nerfstudio.configs.config_utils import to_immutable_dict
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
+from nerfstudio.field_components.rotater import Rotater
 from nerfstudio.model_components.scene_colliders import NearFarCollider
+from nerfstudio.utils import profiler
 
 
 # Model related configs
@@ -50,6 +52,10 @@ class ModelConfig(InstantiateConfig):
     """parameters to instantiate density field with"""
     eval_num_rays_per_chunk: int = 4096
     """specifies number of rays per chunk during eval"""
+    forward_ad_num_rays_per_chunk: int = 4096
+    """specifies number of rays per chunk during forward_ad"""
+    backward_num_rays_per_chunk: int = 4096
+    """specifies number of rays per chunk during backward"""
     prompt: Optional[str] = None
     """A prompt to be used in text to NeRF models"""
 
@@ -71,6 +77,7 @@ class Model(nn.Module):
         config: ModelConfig,
         scene_box: SceneBox,
         num_train_data: int,
+        rotater: Optional[Rotater] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -80,11 +87,13 @@ class Model(nn.Module):
         self.num_train_data = num_train_data
         self.kwargs = kwargs
         self.collider = None
+        self.rotater = rotater
 
         self.populate_modules()  # populate the modules
         self.callbacks = None
         # to keep track of which device the nn.Module is on
         self.device_indicator_param = nn.Parameter(torch.empty(0))
+        self.generator_states = []
 
     @property
     def device(self):
@@ -107,6 +116,24 @@ class Model(nn.Module):
             self.collider = NearFarCollider(
                 near_plane=self.config.collider_params["near_plane"], far_plane=self.config.collider_params["far_plane"]
             )
+        self.grad_scaler: torch.cuda.amp.GradScaler = self.kwargs['grad_scaler']
+        self.mixed_precision: bool = self.kwargs['mixed_precision']
+        self.other_losses = {}
+        self._num_processed_rays = 0
+
+    def clear_num_processed_rays(self):
+        self._num_processed_rays = 0
+
+    def num_processed_rays(self):
+        return self._num_processed_rays
+
+    def clear_other_losses(self):
+        self.other_losses = {}
+
+    def aggregate_other_losses(self, loss_dict):
+        for k, v in loss_dict.items():
+            self.other_losses.setdefault(k, 0)
+            self.other_losses[k] += v.detach()
 
     @abstractmethod
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -128,18 +155,37 @@ class Model(nn.Module):
             Outputs of model. (ie. rendered colors)
         """
 
-    def forward(self, ray_bundle: RayBundle) -> Dict[str, Union[torch.Tensor, List]]:
+    @abstractmethod
+    def get_point_lights(self, ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+        """Takes in a Ray Bundle and returns a dictionary of outputs.
+
+        Args:
+            ray_bundle: Input bundle of rays. This raybundle should have all the
+            needed information to compute the outputs.
+
+        Returns:
+            Outputs of model. (ie. rendered colors)
+        """
+
+    def forward(self, ray_bundle: RayBundle, is_backward=False) -> Dict[str, Union[torch.Tensor, List]] | Tuple[
+        Dict[str, Union[torch.Tensor, List]], Dict[str, torch.Tensor]]:
         """Run forward starting with a ray bundle. This outputs different things depending on the configuration
         of the model and whether or not the batch is provided (whether or not we are training basically)
 
         Args:
             ray_bundle: containing all the information needed to render that ray latents included
+            is_backward: whether it it should call get_backward_outputs
         """
 
         if self.collider is not None:
             ray_bundle = self.collider(ray_bundle)
 
-        return self.get_outputs(ray_bundle)
+        if is_backward:
+            outputs = self.get_backward_outputs(ray_bundle)
+            reg_loss_dict = self.get_reg_loss_dict(outputs)
+            return outputs, reg_loss_dict
+        else:
+            return self.get_outputs(ray_bundle)
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
@@ -187,6 +233,143 @@ class Model(nn.Module):
             outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
         return outputs
 
+    def get_rgba_image(self, outputs: Dict[str, torch.Tensor], output_name: str = "rgb") -> torch.Tensor:
+        """Returns the RGBA image from the outputs of the model.
+
+        Args:
+            outputs: Outputs of the model.
+
+        Returns:
+            RGBA image.
+        """
+        accumulation_name = output_name.replace("rgb", "accumulation")
+        if (
+            not hasattr(self, "renderer_rgb")
+            or not hasattr(self.renderer_rgb, "background_color")
+            or accumulation_name not in outputs
+        ):
+            raise NotImplementedError(f"get_rgba_image is not implemented for model {self.__class__.__name__}")
+        rgb = outputs[output_name]
+        if self.renderer_rgb.background_color == "random":  # type: ignore
+            acc = outputs[accumulation_name]
+            if acc.dim() < rgb.dim():
+                acc = acc.unsqueeze(-1)
+            return torch.cat((rgb / acc.clamp(min=1e-10), acc), dim=-1)
+        return torch.cat((rgb, torch.ones_like(rgb[..., :1])), dim=-1)
+
+    @profiler.time_function
+    @torch.no_grad()
+    def get_point_lights_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+        """Takes in camera parameters and computes the output of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+        """
+        self.generator_states = [g.get_state() for g in self.get_generators()]
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        num_rays = len(camera_ray_bundle)
+        self._num_processed_rays += num_rays
+        cpu_or_cuda_str: str = str(self.device).split(":")[0]
+        outputs_lists = defaultdict(list)
+        with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+            for i in range(0, num_rays, num_rays_per_chunk):
+                start_idx = i
+                end_idx = i + num_rays_per_chunk
+                ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+                outputs = self.get_point_lights(ray_bundle=ray_bundle)
+                for output_name, output in outputs.items():  # type: ignore
+                    outputs_lists[output_name].append(output)
+        outputs = {}
+        for output_name, outputs_list in outputs_lists.items():
+            if not torch.is_tensor(outputs_list[0]):
+                # TODO: handle lists of tensors as well
+                continue
+            outputs[output_name] = torch.cat(outputs_list).float()  # type: ignore
+        return outputs
+
+    @profiler.time_function
+    @torch.no_grad()
+    def get_rgb_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> torch.Tensor:
+        """Takes in camera parameters and computes the output of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+        """
+        # remember random generator states
+        self.generator_states = [g.get_state() for g in self.get_generators()]
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        num_rays = len(camera_ray_bundle)
+        self._num_processed_rays += num_rays
+        cpu_or_cuda_str: str = str(self.device).split(":")[0]
+        rgb_list = []
+        with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+            for i in range(0, num_rays, num_rays_per_chunk):
+                start_idx = i
+                end_idx = i + num_rays_per_chunk
+                ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+                rgb = self.get_rgb(ray_bundle=ray_bundle)
+                rgb_list.append(rgb)
+        rgb = torch.cat(rgb_list).float()
+        return rgb
+
+    @profiler.time_function
+    @torch.no_grad()
+    def forward_grad_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle, grad_o: torch.Tensor,
+                                           grad_v: torch.Tensor) -> torch.Tensor:
+        """Takes in camera parameters and computes the output tangent of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+            grad_o: gradients of camera_ray_bundle.origins
+            grad_v: gradients of camera_ray_bundle.directions
+        """
+        # recover random generator states
+        for (g, state) in zip(self.get_generators(), self.generator_states):
+            g.set_state(state)
+        num_rays_per_chunk = self.config.forward_ad_num_rays_per_chunk
+        num_rays = len(camera_ray_bundle)
+        self._num_processed_rays += num_rays
+        cpu_or_cuda_str: str = str(self.device).split(":")[0]
+        grad_rgb_list = []
+        with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+            for i in range(0, num_rays, num_rays_per_chunk):
+                start_idx = i
+                end_idx = i + num_rays_per_chunk
+                ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+                grad_o_chunk = grad_o.view(-1, grad_o.shape[-1])[start_idx: end_idx]
+                grad_v_chunk = grad_v.view(-1, grad_v.shape[-1])[start_idx: end_idx]
+                grad_rgb = self.forward_grad(ray_bundle=ray_bundle, grad_o=grad_o_chunk, grad_v=grad_v_chunk)
+                grad_rgb_list.append(grad_rgb)
+        grad_rgb = torch.cat(grad_rgb_list).float()
+        return grad_rgb
+
+    def get_rgb(self, ray_bundle: RayBundle) -> torch.Tensor:
+        # naive implementation, can be override
+        return self.forward(ray_bundle=ray_bundle)['rgb']
+
+    @abstractmethod
+    def forward_grad(self, ray_bundle: RayBundle, grad_o: torch.Tensor, grad_v: torch.Tensor) -> torch.Tensor:
+        """
+        Forward mode AD. given grad of inputs, output grad of rgb
+        """
+
+    @abstractmethod
+    def get_reg_loss_dict(self, outputs) -> Dict[str, torch.Tensor]:
+        """Computes and returns the losses dict.
+
+        Args:
+            outputs: the output to compute reg loss dict to
+        """
+
+    def get_generators(self) -> List[torch.Generator]:
+        """Collect all the random generators of the ray sampler.
+        """
+        return []
+
+    def get_backward_outputs(self, ray_bundle:RayBundle) -> Dict[str, torch.Tensor]:
+        # naive implementation, can be override
+        return self.get_outputs(ray_bundle=ray_bundle)
+
     @abstractmethod
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
@@ -219,4 +402,9 @@ class Model(nn.Module):
 
         Args:
             step: training step of the loaded checkpoint
+        """
+
+    def set_disable_aabb(self, flag):
+        """
+        disable aabb
         """

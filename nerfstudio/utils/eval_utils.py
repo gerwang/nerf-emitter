@@ -66,9 +66,12 @@ def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Pat
 
 
 def eval_setup(
-    config_path: Path,
+    config_path: Optional[Path],
     eval_num_rays_per_chunk: Optional[int] = None,
     test_mode: Literal["test", "val", "inference"] = "test",
+    world_size: int = 1,
+    local_rank: int = 0,
+    _config: Optional[TrainerConfig] = None,
 ) -> Tuple[TrainerConfig, Pipeline, Path, int]:
     """Shared setup for loading a saved pipeline for evaluation.
 
@@ -79,13 +82,19 @@ def eval_setup(
             'val': loads train/val datasets into memory
             'test': loads train/test dataset into memory
             'inference': does not load any dataset into memory
+        world_size: for multiprocess
+        local_rank: for multiprocess
+        _config: alternative trainer config
 
 
     Returns:
         Loaded config, pipeline module, corresponding checkpoint, and step
     """
     # load save config
-    config = yaml.load(config_path.read_text(), Loader=yaml.Loader)
+    if config_path is None:
+        config = _config
+    else:
+        config = yaml.load(config_path.read_text(), Loader=yaml.Loader)
     assert isinstance(config, TrainerConfig)
 
     config.pipeline.datamanager._target = all_methods[config.method_name].pipeline.datamanager._target
@@ -99,8 +108,13 @@ def eval_setup(
         config.pipeline.datamanager.eval_image_indices = None
 
     # setup pipeline (which includes the DataManager)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pipeline = config.pipeline.setup(device=device, test_mode=test_mode)
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    pipeline = config.pipeline.setup(
+        device=device,
+        test_mode=test_mode,
+        world_size=world_size,
+        local_rank=local_rank,
+    )
     assert isinstance(pipeline, Pipeline)
     pipeline.eval()
 

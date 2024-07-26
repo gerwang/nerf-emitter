@@ -23,7 +23,7 @@ import torch
 from torch import Tensor, nn
 
 from nerfstudio.cameras.rays import RaySamples
-from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.data.scene_box import SceneBox, aabb_contain
 from nerfstudio.field_components.activations import trunc_exp
 from nerfstudio.field_components.encodings import HashEncoding
 from nerfstudio.field_components.mlp import MLP
@@ -56,7 +56,7 @@ class HashMLPDensityField(Field):
         base_res: int = 16,
         log2_hashmap_size: int = 18,
         features_per_level: int = 2,
-        implementation: Literal["tcnn", "torch"] = "torch",
+        implementation: Literal["tcnn", "torch"] = "tcnn",
     ) -> None:
         super().__init__()
         self.register_buffer("aabb", aabb)
@@ -90,16 +90,22 @@ class HashMLPDensityField(Field):
         else:
             self.linear = torch.nn.Linear(self.encoding.get_out_dim(), 1)
 
+        self.disable_inside_aabb = False
+
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, None]:
+        original_positions = ray_samples.frustums.get_positions()
         if self.spatial_distortion is not None:
-            positions = self.spatial_distortion(ray_samples.frustums.get_positions())
+            positions = self.spatial_distortion(original_positions)
             positions = (positions + 2.0) / 4.0
         else:
-            positions = SceneBox.get_normalized_positions(ray_samples.frustums.get_positions(), self.aabb)
+            positions = SceneBox.get_normalized_positions(original_positions, self.aabb)
         # Make sure the tcnn gets inputs between 0 and 1.
         selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1)
+        if self.disable_inside_aabb:
+            selector &= ~aabb_contain(self.aabb, original_positions)
         positions = positions * selector[..., None]
         positions_flat = positions.view(-1, 3)
+
         if not self.use_linear:
             density_before_activation = (
                 self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1).to(positions)

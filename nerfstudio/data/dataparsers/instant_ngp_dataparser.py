@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Tuple, Type
+from typing import Dict, Tuple, Type, Optional, Literal
 
 import imageio
 import numpy as np
@@ -32,6 +32,12 @@ from nerfstudio.data.dataparsers.base_dataparser import (
     DataparserOutputs,
 )
 from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.data.utils.dataparsers_utils import (
+    get_train_eval_split_filename,
+    get_train_eval_split_fraction,
+    get_train_eval_split_interval,
+    get_train_eval_split_all,
+)
 from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -44,8 +50,34 @@ class InstantNGPDataParserConfig(DataParserConfig):
     """target class to instantiate"""
     data: Path = Path("data/ours/posterv2")
     """Directory or explicit json file path specifying location of data."""
+    mi_data: Optional[Path] = None
+    """Directory or explicit json file path specifying location of data for Mitsuba training, default to same as data"""
     scene_scale: float = 0.3333
     """How much to scale the scene."""
+    data_sub: int = -1
+    """Preserve first few images"""
+    load_mask: bool = True
+    """Exclude mask loading"""
+    val_data: Optional[Path] = None
+    """Validate data to use when split=val"""
+    test_data: Optional[Path] = None
+    """Validate data to use when split=test"""
+    eval_mode: Literal["fraction", "filename", "interval", "all"] = "fraction"
+    """
+    The method to use for splitting the dataset into train and eval.
+    Fraction splits based on a percentage for train and the remaining for eval.
+    Filename splits based on filenames containing train/eval.
+    Interval uses every nth frame for eval.
+    All uses all the images for any split.
+    """
+    train_split_fraction: float = 0.9
+    """The percentage of the dataset to use for training. Only used when eval_mode is train-split-fraction."""
+    eval_interval: int = 8
+    """The interval between frames to use for eval. Only used when eval_mode is eval-interval."""
+    tone_mapping: bool = False
+    """Whether doing tone mapping to convert HDR to sRGB"""
+    aabb_scale_override: Optional[float] = None
+    """Override aabb scale"""
 
 
 @dataclass
@@ -55,17 +87,33 @@ class InstantNGP(DataParser):
     config: InstantNGPDataParserConfig
 
     def _generate_dataparser_outputs(self, split="train"):
-        if self.config.data.suffix == ".json":
-            meta = load_from_json(self.config.data)
-            data_dir = self.config.data.parent
+        data_path = self.config.data
+        if split == 'mi_train':
+            split = 'train'
+            if self.config.mi_data is not None:
+                data_path = self.config.mi_data
+        elif split == 'test' and self.config.test_data is not None:
+            data_path = self.config.test_data
+        elif split == 'val' and self.config.val_data is not None:
+            data_path = self.config.val_data
+
+        if data_path.suffix == ".json":
+            meta = load_from_json(data_path)
+            data_dir = data_path.parent
         else:
-            meta = load_from_json(self.config.data / "transforms.json")
-            data_dir = self.config.data
+            meta = load_from_json(data_path / "transforms.json")
+            data_dir = data_path
+
+        if self.config.data_sub != -1:
+            meta['frames'] = meta['frames'][:self.config.data_sub]
+        if len(meta['frames']) == 1:
+            meta['frames'].extend(meta['frames'])  # extend to 2, avoid various crashed
 
         image_filenames = []
         mask_filenames = []
         poses = []
         num_skipped_image_filenames = 0
+        rotations = []
         for frame in meta["frames"]:
             fname = data_dir / Path(frame["file_path"])
             # search for png file
@@ -89,16 +137,48 @@ class InstantNGP(DataParser):
                 if "mask_path" in frame:
                     mask_fname = data_dir / Path(frame["mask_path"])
                     mask_filenames.append(mask_fname)
+            if 'rotation' in frame:
+                rotations.append(frame['rotation'])
+        if not self.config.load_mask:
+            mask_filenames = []
         if num_skipped_image_filenames >= 0:
             CONSOLE.print(f"Skipping {num_skipped_image_filenames} files in dataset split {split}.")
         assert (
             len(image_filenames) != 0
         ), """
-        No image files found. 
+        No image files found.
         You should check the file_paths in the transforms.json file to make sure they are correct.
         """
         poses = np.array(poses).astype(np.float32)
         poses[:, :3, 3] *= self.config.scene_scale
+
+        # find train and eval indices based on the eval_mode specified
+        if self.config.eval_mode == "fraction":
+            i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
+        elif self.config.eval_mode == "filename":
+            i_train, i_eval = get_train_eval_split_filename(image_filenames)
+        elif self.config.eval_mode == "interval":
+            i_train, i_eval = get_train_eval_split_interval(image_filenames, self.config.eval_interval)
+        elif self.config.eval_mode == "all":
+            CONSOLE.log(
+                "[yellow] Be careful with '--eval-mode=all'. If using camera optimization, the cameras may diverge in the current implementation, giving unpredictable results."
+            )
+            i_train, i_eval = get_train_eval_split_all(image_filenames)
+        else:
+            raise ValueError(f"Unknown eval mode {self.config.eval_mode}")
+
+        if split == "train":
+            indices = i_train
+        elif split in ["val", "test"]:
+            indices = i_eval
+        else:
+            raise ValueError(f"Unknown dataparser split {split}")
+        # Choose image_filenames and poses based on split, but after auto orient and scaling the poses.
+        image_filenames = [image_filenames[i] for i in indices]
+        mask_filenames = [mask_filenames[i] for i in indices] if len(mask_filenames) > 0 else []
+
+        idx_tensor = torch.tensor(indices, dtype=torch.long)
+        poses = poses[idx_tensor]
 
         camera_to_world = torch.from_numpy(poses[:, :3])  # camera to world transform
 
@@ -113,7 +193,11 @@ class InstantNGP(DataParser):
 
         # in x,y,z order
         # assumes that the scene is centered at the origin
-        aabb_scale = 0.5 * meta.get("aabb_scale", 1)
+        # aabb_scale = 0.5 * meta.get("aabb_scale", 1)
+        if self.config.aabb_scale_override is not None:
+            aabb_scale = self.config.aabb_scale_override
+        else:
+            aabb_scale = 1.0 * self.config.scene_scale
 
         scene_box = SceneBox(
             aabb=torch.tensor(
@@ -141,13 +225,22 @@ class InstantNGP(DataParser):
             camera_type=camera_type,
         )
 
+        metadata = {}
+        if len(rotations) > 0:
+            rotations = [rotations[x] for x in indices]
+            assert len(rotations) == len(image_filenames)
+            metadata['rotations'] = rotations
+
         # TODO(ethan): add alpha background color
         dataparser_outputs = DataparserOutputs(
             image_filenames=image_filenames,
             cameras=cameras,
             scene_box=scene_box,
             mask_filenames=mask_filenames if len(mask_filenames) > 0 else None,
+            metadata=metadata,
             dataparser_scale=self.config.scene_scale,
+            is_hdr=image_filenames[0].suffix in ['.exr', '.hdr'],
+            tone_mapping=self.config.tone_mapping,
         )
 
         return dataparser_outputs

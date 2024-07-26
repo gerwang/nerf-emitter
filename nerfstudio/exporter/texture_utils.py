@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union, Dict
 
 import mediapy as media
 import numpy as np
@@ -30,6 +30,8 @@ import xatlas
 from jaxtyping import Float
 from torch import Tensor
 
+import drjit as dr
+import mitsuba as mi
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.exporter.exporter_utils import Mesh
 from nerfstudio.pipelines.base_pipeline import Pipeline
@@ -322,12 +324,13 @@ def unwrap_mesh_with_xatlas(
 
 def export_textured_mesh(
     mesh: Mesh,
-    pipeline: Pipeline,
+    pipeline_or_volume_dict: Pipeline | Dict[str, mi.Volume],
     output_dir: Path,
     px_per_uv_triangle: Optional[int],
     unwrap_method: Literal["xatlas", "custom"] = "xatlas",
     raylen_method: Literal["edge", "none"] = "edge",
     num_pixels_per_side=1024,
+    write_normals=True,
 ) -> None:
     """Textures a mesh using the radiance field from the Pipeline.
     The mesh is written to an OBJ file in the output directory,
@@ -336,7 +339,7 @@ def export_textured_mesh(
 
     Args:
         mesh: The mesh to texture.
-        pipeline: The pipeline to use for texturing.
+        pipeline_or_volume_dict: The pipeline to use for texturing.
         output_dir: The directory to write the textured mesh to.
         px_per_uv_triangle: The number of pixels per side of UV triangle. Required for "custom" unwrapping.
         unwrap_method: The method to use for unwrapping the mesh.
@@ -344,7 +347,8 @@ def export_textured_mesh(
         num_pixels_per_side: The number of pixels per side of the texture image.
     """
 
-    device = pipeline.device
+    device = pipeline_or_volume_dict.device if isinstance(pipeline_or_volume_dict, Pipeline) \
+        else 'cuda:0'
 
     vertices = mesh.vertices.to(device)
     faces = mesh.faces.to(device)
@@ -382,52 +386,68 @@ def export_textured_mesh(
     else:
         raise ValueError(f"Ray length method {raylen_method} not supported.")
 
-    summary_log.append(f"Length of rendered rays to compute texture values: {raylen}")
+    if isinstance(pipeline_or_volume_dict, Pipeline):
+        material_name = 'material_0'
+        summary_log.append(f"Length of rendered rays to compute texture values: {raylen}")
 
-    origins = origins - 0.5 * raylen * directions
-    pixel_area = torch.ones_like(origins[..., 0:1])
-    camera_indices = torch.zeros_like(origins[..., 0:1])
-    nears = torch.zeros_like(origins[..., 0:1])
-    fars = torch.ones_like(origins[..., 0:1]) * raylen
-    directions_norm = torch.ones_like(origins[..., 0:1])  # for surface model
-    camera_ray_bundle = RayBundle(
-        origins=origins,
-        directions=directions,
-        pixel_area=pixel_area,
-        camera_indices=camera_indices,
-        nears=nears,
-        fars=fars,
-        metadata={"directions_norm": directions_norm},
-    )
+        origins = origins - 0.5 * raylen * directions
+        pixel_area = torch.ones_like(origins[..., 0:1])
+        camera_indices = torch.zeros_like(origins[..., 0:1])
+        nears = torch.zeros_like(origins[..., 0:1])
+        fars = torch.ones_like(origins[..., 0:1]) * raylen
+        directions_norm = torch.ones_like(origins[..., 0:1])  # for surface model
+        camera_ray_bundle = RayBundle(
+            origins=origins,
+            directions=directions,
+            pixel_area=pixel_area,
+            camera_indices=camera_indices,
+            nears=nears,
+            fars=fars,
+            metadata={"directions_norm": directions_norm},
+        )
 
-    CONSOLE.print("Creating texture image by rendering with NeRF...")
-    with torch.no_grad():
-        outputs = pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+        CONSOLE.print("Creating texture image by rendering with NeRF...")
+        with torch.no_grad():
+            outputs = pipeline_or_volume_dict.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+        # TODO: this can be done better by using the alpha channel
+        rgb = pipeline_or_volume_dict.model.get_rgba_image(outputs, "rgb")[..., :3]
 
-    # save the texture image
-    texture_image = outputs["rgb"].cpu().numpy()
-    media.write_image(str(output_dir / "material_0.png"), texture_image)
+        # save the texture image
+        texture_image = rgb.cpu().numpy()
+        media.write_image(str(output_dir / f"{material_name}.png"), texture_image)
+    else:
+        material_name = 'material_0'
+        for name, volume in pipeline_or_volume_dict.items():
+            this_name = name.replace('.', '-')
+            if material_name == 'material_0':
+                material_name = this_name
+            CONSOLE.print(f"Creating {name} image by querying Mitsuba Volumes...")
+            inter = dr.zeros(mi.Interaction3f)
+            inter.p = mi.Point3f(origins.reshape(-1, 3))
+            rgb = volume.eval(inter).torch().reshape(origins.shape)
+            texture_image = rgb.cpu().numpy()
+            media.write_image(str(output_dir / f"{this_name}.png"), texture_image)
 
     CONSOLE.print("Writing relevant OBJ information to files...")
     # create the .mtl file
     lines_mtl = [
         "# Generated with nerfstudio",
-        "newmtl material_0",
+        f"newmtl {material_name}",
         "Ka 1.000 1.000 1.000",
         "Kd 1.000 1.000 1.000",
         "Ks 0.000 0.000 0.000",
         "d 1.0",
         "illum 2",
         "Ns 1.00000000",
-        "map_Kd material_0.png",
+        f"map_Kd {material_name}.png",
     ]
     lines_mtl = [line + "\n" for line in lines_mtl]
-    file_mtl = open(output_dir / "material_0.mtl", "w", encoding="utf-8")
+    file_mtl = open(output_dir / f"{material_name}.mtl", "w", encoding="utf-8")
     file_mtl.writelines(lines_mtl)
     file_mtl.close()
 
     # create the .obj file
-    lines_obj = ["# Generated with nerfstudio", "mtllib material_0.mtl", "usemtl material_0"]
+    lines_obj = ["# Generated with nerfstudio", f"mtllib {material_name}.mtl", f"usemtl {material_name}"]
     lines_obj = [line + "\n" for line in lines_obj]
     file_obj = open(output_dir / "mesh.obj", "w", encoding="utf-8")
     file_obj.writelines(lines_obj)
@@ -450,14 +470,15 @@ def export_textured_mesh(
                 line = f"vt {uv[0]} {1.0 - uv[1]}\n"
                 file_obj.write(line)
 
-    # write the vertex normals
-    vertex_normals = vertex_normals.cpu().numpy()
-    progress = get_progress("Writing vertex normals to file", suffix="lines-per-sec")
-    with progress:
-        for i in progress.track(range(len(vertex_normals))):
-            normal = vertex_normals[i]
-            line = f"vn {normal[0]} {normal[1]} {normal[2]}\n"
-            file_obj.write(line)
+    if write_normals:
+        # write the vertex normals
+        vertex_normals = vertex_normals.cpu().numpy()
+        progress = get_progress("Writing vertex normals to file", suffix="lines-per-sec")
+        with progress:
+            for i in progress.track(range(len(vertex_normals))):
+                normal = vertex_normals[i]
+                line = f"vn {normal[0]} {normal[1]} {normal[2]}\n"
+                file_obj.write(line)
 
     # write the faces
     faces = faces.cpu().numpy()
@@ -474,15 +495,18 @@ def export_textured_mesh(
             vn1 = v1
             vn2 = v2
             vn3 = v3
-            line = f"f {v1}/{vt1}/{vn1} {v2}/{vt2}/{vn2} {v3}/{vt3}/{vn3}\n"
+            if write_normals:
+                line = f"f {v1}/{vt1}/{vn1} {v2}/{vt2}/{vn2} {v3}/{vt3}/{vn3}\n"
+            else:
+                line = f"f {v1}/{vt1} {v2}/{vt2} {v3}/{vt3}\n"
             file_obj.write(line)
 
     file_obj.close()
 
     summary_log.append(f"OBJ file saved to {output_dir / 'mesh.obj'}")
-    summary_log.append(f"MTL file saved to {output_dir / 'material_0.mtl'}")
+    summary_log.append(f"MTL file saved to {output_dir / f'{material_name}.mtl'}")
     summary_log.append(
-        f"Texture image saved to {output_dir / 'material_0.png'} "
+        f"Texture image saved to {output_dir / f'{material_name}.png'} "
         f"with resolution {texture_image.shape[1]}x{texture_image.shape[0]} (WxH)"
     )
 

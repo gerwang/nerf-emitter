@@ -17,9 +17,10 @@
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
+from trimesh.transformations import decompose_matrix
 
 from nerfstudio.process_data.process_data_utils import CAMERA_MODELS
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -37,6 +38,10 @@ def metashape_to_json(
     xml_filename: Path,
     output_dir: Path,
     verbose: bool = False,
+    output_name: str = "transforms.json",
+    extra_transform: Optional[np.ndarray] = None,
+    no_conversion: bool = False,
+    rotation_name: Optional[str] = None,
 ) -> List[str]:
     """Convert Metashape data into a nerfstudio dataset.
 
@@ -45,6 +50,9 @@ def metashape_to_json(
         xml_filename: Path to the metashape cameras xml file.
         output_dir: Path to the output directory.
         verbose: Whether to print verbose output.
+        output_name: Output file name
+        extra_transform: Extra transformation matrix to apply
+        no_conversion: See https://github.com/nerfstudio-project/nerfstudio/issues/2294
 
     Returns:
         Summary of the conversion.
@@ -55,12 +63,11 @@ def metashape_to_json(
     chunk = root[0]
     sensors = chunk.find("sensors")
 
-    # TODO Add support for per-frame intrinsics
     if sensors is None:
         raise ValueError("No sensors found")
 
     calibrated_sensors = [
-        sensor for sensor in sensors if sensor.get("type") == "spherical" or sensor.find("calibration")
+        sensor for sensor in sensors.iter("sensor") if sensor.get("type") == "spherical" or sensor.find("calibration")
     ]
     if not calibrated_sensors:
         raise ValueError("No calibrated sensor found in Metashape XML")
@@ -116,7 +123,7 @@ def metashape_to_json(
     components = chunk.find("components")
     component_dict = {}
     if components is not None:
-        for component in components:
+        for component in components.iter("component"):
             transform = component.find("transform")
             if transform is not None:
                 rotation = transform.find("rotation")
@@ -139,25 +146,41 @@ def metashape_to_json(
                     s = float(scale.text)
 
                 m = np.eye(4)
-                m[:3, :3] = r
-                m[:3, 3] = t / s
+                if no_conversion:
+                    m[:3, :3] = r * s
+                    m[:3, 3] = t
+                else:
+                    m[:3, :3] = r
+                    m[:3, 3] = t / s
                 component_dict[component.get("id")] = m
 
     frames = []
     cameras = chunk.find("cameras")
     assert cameras is not None, "Cameras not found in Metashape xml"
     num_skipped = 0
-    for camera in cameras:
+    for camera in cameras.iter("camera"):
         frame = {}
         camera_label = camera.get("label")
         assert isinstance(camera_label, str)
-        if camera_label not in image_filename_map:
-            # Labels sometimes have a file extension. Try without the extension.
-            # (maybe it's just a '.' in the image name)
-            camera_label = camera_label.split(".")[0]  # type: ignore
-            if camera_label not in image_filename_map:
+        if rotation_name is not None:
+            degree_original_name_key = f"{camera_label}_{rotation_name}degree"
+            if degree_original_name_key not in image_filename_map:
+                # Labels sometimes have a file extension. Try without the extension.
+                # (maybe it's just a '.' in the image name)
+                camera_label = camera_label.split(".")[0]  # type: ignore
+                if verbose:
+                    CONSOLE.print(f"Missing image for {camera.get('label')}, Skipping")
                 continue
-        frame["file_path"] = image_filename_map[camera_label].as_posix()
+            frame["file_path"] = image_filename_map[degree_original_name_key].as_posix()
+        else:
+            if camera_label not in image_filename_map:
+                # Labels sometimes have a file extension. Try without the extension.
+                # (maybe it's just a '.' in the image name)
+                camera_label = camera_label.split(".")[0]  # type: ignore
+                if verbose:
+                    CONSOLE.print(f"Missing image for {camera.get('label')}, Skipping")
+                continue
+            frame["file_path"] = image_filename_map[camera_label].as_posix()
 
         sensor_id = camera.get("sensor_id")
         if sensor_id not in sensor_dict:
@@ -179,15 +202,21 @@ def metashape_to_json(
         component_id = camera.get("component_id")
         if component_id in component_dict:
             transform = component_dict[component_id] @ transform
+        if extra_transform is not None:
+            transform = extra_transform @ transform
 
-        transform = transform[[2, 0, 1, 3], :]
+        # remove scale component
+        scale, _, _, _, _ = decompose_matrix(transform)
+        transform[:3, :3] /= scale  # completely remove the scale component
+        if not no_conversion:
+            transform = transform[[2, 0, 1, 3], :]
         transform[:, 1:3] *= -1
         frame["transform_matrix"] = transform.tolist()
         frames.append(frame)
 
     data["frames"] = frames
 
-    with open(output_dir / "transforms.json", "w", encoding="utf-8") as f:
+    with open(output_dir / output_name, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
     summary = []

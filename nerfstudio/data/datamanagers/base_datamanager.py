@@ -18,11 +18,12 @@ Datamanager.
 
 from __future__ import annotations
 
-import functools
+import os
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from functools import cached_property
 from typing import (
     Any,
     Callable,
@@ -35,6 +36,9 @@ from typing import (
     Type,
     Union,
     cast,
+    ForwardRef,
+    get_origin,
+    get_args,
 )
 
 import torch
@@ -43,6 +47,7 @@ from torch.nn import Parameter
 from torch.utils.data.distributed import DistributedSampler
 from typing_extensions import TypeVar
 
+import mitsuba as mi
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.cameras.cameras import CameraType
 from nerfstudio.cameras.rays import RayBundle
@@ -52,9 +57,9 @@ from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.dataparsers.blender_dataparser import BlenderDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.pixel_samplers import (
-    EquirectangularPixelSampler,
-    PatchPixelSampler,
     PixelSampler,
+    PixelSamplerConfig,
+    PatchPixelSamplerConfig,
 )
 from nerfstudio.data.utils.dataloaders import (
     CacheDataloader,
@@ -63,9 +68,11 @@ from nerfstudio.data.utils.dataloaders import (
 )
 from nerfstudio.data.utils.nerfstudio_collate import nerfstudio_collate
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
+from nerfstudio.field_components.rotater import Rotater
 from nerfstudio.model_components.ray_generators import RayGenerator
 from nerfstudio.utils.misc import IterableWrapper
 from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.utils.misc import get_orig_class
 
 
 def variable_res_collate(batch: List[Dict]) -> Dict:
@@ -111,6 +118,18 @@ class DataManagerConfig(InstantiateConfig):
     """Source of data, may not be used by all models."""
     camera_optimizer: Optional[CameraOptimizerConfig] = None
     """Specifies the camera pose optimizer used during training. Helpful if poses are noisy."""
+    masks_on_gpu: bool = False
+    """Process masks on GPU for speed at the expense of memory, if True."""
+    images_on_gpu: bool = False
+    """Process images on GPU for speed at the expense of memory, if True."""
+    masked_sampling: bool = False
+    """Whether it only samples pixels within masks"""
+    load_dir: Optional[Path] = None
+    """Checkpoint to load the datamanager"""
+    load_step: Optional[int] = None
+    """Optionally specify model step to load from; if none, will find most recent model in load_dir."""
+    mock_zero_rotation: bool = False
+    """Reset all rotations as 0"""
 
 
 class DataManager(nn.Module):
@@ -184,6 +203,26 @@ class DataManager(nn.Module):
         if self.eval_dataset and self.test_mode != "inference":
             self.setup_eval()
 
+    def load_checkpoint(self):
+        load_dir = self.config.load_dir
+        if load_dir is not None:
+            load_step = self.config.load_step
+            if load_step is None:
+                print("Loading latest Nerfstudio datamanager checkpoint from load_dir...")
+                # NOTE: this is specific to the checkpoint name format
+                load_step = sorted(int(x[x.find("-") + 1: x.find(".")]) for x in os.listdir(load_dir))[-1]
+            load_path: Path = load_dir / f"step-{load_step:09d}.ckpt"
+            assert load_path.exists(), f"Checkpoint {load_path} does not exist"
+            loaded_state = torch.load(load_path, map_location="cpu")['pipeline']
+            loaded_state = {
+                key[len("datamanager."):]: value for key, value in
+                loaded_state.items() if key.startswith("datamanager.")
+            }
+            if 'rotater.rotation_ids' in loaded_state:
+                del loaded_state['rotater.rotation_ids']  # patch rotation_ids, we don't need it
+            self.load_state_dict(loaded_state)
+            CONSOLE.print(f"Done loading Nerfstudio datamanager checkpoint from {load_path}")
+
     def forward(self):
         """Blank forward method
 
@@ -248,6 +287,25 @@ class DataManager(nn.Module):
         Returns:
             A tuple of the ray bundle for the image, and a dictionary of additional batch information
             such as the groundtruth image.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def next_train_mitsuba(self, step: int) -> Tuple[mi.Sensor, Dict]:
+        """Returns the next batch of data from the train data manager.
+        Consider resolution scale and random crop
+
+        Args:
+            step: the step number of the eval image to retrieve
+        Returns:
+            A tuple of the mi.Sensor for the image, and a dictionary of additional batch information
+            such as the groundtruth image.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def rescale_train(self, scale_factor):
+        """Reload the training dataset with a different scale factor
         """
         raise NotImplementedError
 
@@ -340,6 +398,14 @@ class VanillaDataManagerConfig(DataManagerConfig):
     """
     patch_size: int = 1
     """Size of patch to sample from. If >1, patch-based sampling will be used."""
+    pixel_sampler: PixelSamplerConfig = PixelSamplerConfig()
+    """Specifies the pixel sampler used to sample pixels from images."""
+    pre_mult_mask: bool = False
+    """Multiple the image by the mask to mask out background."""
+    disable_rotater: bool = False
+    """Disable rotater when evaluation is performed"""
+    use_test_rotations: bool = False
+    """Use test dataset's rotation id, Useful for evaluation"""
 
 
 TDataset = TypeVar("TDataset", bound=InputDataset, default=InputDataset)
@@ -374,7 +440,6 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         local_rank: int = 0,
         **kwargs,
     ):
-        self.dataset_type: Type[TDataset] = kwargs.get("_dataset_type", getattr(TDataset, "__default__"))
         self.config = config
         self.device = device
         self.world_size = world_size
@@ -396,6 +461,10 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         self.train_dataset = self.create_train_dataset()
         self.eval_dataset = self.create_eval_dataset()
         self.exclude_batch_keys_from_device = self.train_dataset.exclude_batch_keys_from_device
+        if self.config.masks_on_gpu is True:
+            self.exclude_batch_keys_from_device.remove("mask")
+        if self.config.images_on_gpu is True:
+            self.exclude_batch_keys_from_device.remove("image")
 
         if self.train_dataparser_outputs is not None:
             cameras = self.train_dataparser_outputs.cameras
@@ -405,21 +474,58 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
                         CONSOLE.print("Variable resolution, using variable_res_collate")
                         self.config.collate_fn = variable_res_collate
                         break
-
         super().__init__()
+        self.rotater = None
+        self.train_rotation_optimizer = None
+        metadata = self.train_dataparser_outputs.metadata
+        if 'rotations' in metadata and not self.config.disable_rotater:
+            rotations = metadata['rotations']
+            if self.config.use_test_rotations:
+                rotations = self.dataparser.get_dataparser_outputs(split="test").metadata['rotations']
+            self.rotater = Rotater(rotations,
+                                   self.train_dataparser_outputs.dataparser_scale,
+                                   transform_matrices=metadata.get('rotation_transform_matrices', None),
+                                   rotation_aabb=metadata.get('rotation_aabb', None))
+            if self.config.mock_zero_rotation:
+                self.rotater.rotation_ids[:] = self.rotater.id_mapping[0.0]
+            self.train_rotation_optimizer = self.config.camera_optimizer.setup(
+                num_cameras=self.rotater.num_rotations(), device=self.device,
+                non_trainable_camera_indices=torch.tensor([self.rotater.id_mapping[0.0]]),
+                # disable rotation 0 optimization
+            )
+            self.rotater.set_rotation_optimizer(self.train_rotation_optimizer)
 
-    def __class_getitem__(cls, item):
-        return type(
-            cls.__name__,
-            (cls,),
-            {"__module__": cls.__module__, "__init__": functools.partialmethod(cls.__init__, _dataset_type=item)},
-        )
+    @cached_property
+    def dataset_type(self) -> Type[TDataset]:
+        """Returns the dataset type passed as the generic argument"""
+        default: Type[TDataset] = cast(TDataset, TDataset.__default__)  # type: ignore
+        orig_class: Type[VanillaDataManager] = get_orig_class(self, default=None)  # type: ignore
+        if type(self) is VanillaDataManager and orig_class is None:
+            return default
+        if orig_class is not None and get_origin(orig_class) is VanillaDataManager:
+            return get_args(orig_class)[0]
+
+        # For inherited classes, we need to find the correct type to instantiate
+        for base in getattr(self, "__orig_bases__", []):
+            if get_origin(base) is VanillaDataManager:
+                for value in get_args(base):
+                    if isinstance(value, ForwardRef):
+                        if value.__forward_evaluated__:
+                            value = value.__forward_value__
+                        elif value.__forward_module__ is None:
+                            value.__forward_module__ = type(self).__module__
+                            value = getattr(value, "_evaluate")(None, None, set())
+                    assert isinstance(value, type)
+                    if issubclass(value, InputDataset):
+                        return cast(Type[TDataset], value)
+        return default
 
     def create_train_dataset(self) -> TDataset:
         """Sets up the data loaders for training"""
         return self.dataset_type(
             dataparser_outputs=self.train_dataparser_outputs,
             scale_factor=self.config.camera_res_scale_factor,
+            pre_mult_mask=self.config.pre_mult_mask,
         )
 
     def create_eval_dataset(self) -> TDataset:
@@ -427,21 +533,20 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         return self.dataset_type(
             dataparser_outputs=self.dataparser.get_dataparser_outputs(split=self.test_split),
             scale_factor=self.config.camera_res_scale_factor,
+            pre_mult_mask=self.config.pre_mult_mask,
         )
 
-    def _get_pixel_sampler(self, dataset: TDataset, *args: Any, **kwargs: Any) -> PixelSampler:
+    def _get_pixel_sampler(self, dataset: TDataset, num_rays_per_batch: int) -> PixelSampler:
         """Infer pixel sampler to use."""
-        if self.config.patch_size > 1:
-            return PatchPixelSampler(*args, **kwargs, patch_size=self.config.patch_size)
-
-        # If all images are equirectangular, use equirectangular pixel sampler
-        is_equirectangular = dataset.cameras.camera_type == CameraType.EQUIRECTANGULAR.value
-        if is_equirectangular.all():
-            return EquirectangularPixelSampler(*args, **kwargs)
-        # Otherwise, use the default pixel sampler
+        if self.config.patch_size > 1 and type(self.config.pixel_sampler) is PixelSamplerConfig:
+            return PatchPixelSamplerConfig(patch_size=self.config.patch_size,
+                                           num_rays_per_batch=num_rays_per_batch).setup()
+        is_equirectangular = (dataset.cameras.camera_type == CameraType.EQUIRECTANGULAR.value).all()
         if is_equirectangular.any():
             CONSOLE.print("[bold yellow]Warning: Some cameras are equirectangular, but using default pixel sampler.")
-        return PixelSampler(*args, **kwargs)
+        return self.config.pixel_sampler.setup(
+            is_equirectangular=is_equirectangular, num_rays_per_batch=num_rays_per_batch
+        )
 
     def setup_train(self):
         """Sets up the data loaders for training"""
@@ -511,6 +616,8 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         batch = self.train_pixel_sampler.sample(image_batch)
         ray_indices = batch["indices"]
         ray_bundle = self.train_ray_generator(ray_indices)
+        if self.rotater is not None:
+            ray_bundle.rotater = self.rotater.apply_frustums
         return ray_bundle, batch
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
@@ -553,5 +660,13 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
             param_groups[self.config.camera_optimizer.param_group] = camera_opt_params
         else:
             assert len(camera_opt_params) == 0
+
+        if self.train_rotation_optimizer is not None:
+            rotation_opt_params = list(self.train_rotation_optimizer.parameters())
+            if self.config.camera_optimizer.mode != "off":
+                assert len(rotation_opt_params) > 0
+                param_groups[self.config.camera_optimizer.rotation_param_group] = rotation_opt_params
+            else:
+                assert len(rotation_opt_params) == 0
 
         return param_groups

@@ -69,6 +69,12 @@ class DataparserOutputs:
     """Transform applied by the dataparser."""
     dataparser_scale: float = 1.0
     """Scale applied by the dataparser."""
+    is_hdr: bool = False
+    """Whether the data format is HDR"""
+    to_linear: bool = False
+    """Whether it performs sRGB to Linear to mock HDR training data"""
+    tone_mapping: bool = False
+    """Whether doing tone mapping to convert HDR to sRGB"""
 
     def as_dict(self) -> dict:
         """Returns the dataclass as a dictionary."""

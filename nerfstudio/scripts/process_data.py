@@ -18,13 +18,14 @@
 
 import sys
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
+from typing import Union, List
 
 import numpy as np
 import tyro
 from typing_extensions import Annotated
+import re
 
 from nerfstudio.process_data import (
     metashape_utils,
@@ -33,12 +34,8 @@ from nerfstudio.process_data import (
     realitycapture_utils,
     record3d_utils,
 )
-from nerfstudio.process_data.colmap_converter_to_nerfstudio_dataset import (
-    BaseConverterToNerfstudioDataset,
-)
-from nerfstudio.process_data.images_to_nerfstudio_dataset import (
-    ImagesToNerfstudioDataset,
-)
+from nerfstudio.process_data.colmap_converter_to_nerfstudio_dataset import BaseConverterToNerfstudioDataset
+from nerfstudio.process_data.images_to_nerfstudio_dataset import ImagesToNerfstudioDataset
 from nerfstudio.process_data.video_to_nerfstudio_dataset import VideoToNerfstudioDataset
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -89,7 +86,10 @@ class ProcessRecord3D(BaseConverterToNerfstudioDataset):
         record3d_image_filenames = list(np.array(record3d_image_filenames)[idx])
         # Copy images to output directory
         copied_image_paths = process_data_utils.copy_images_list(
-            record3d_image_filenames, image_dir=image_dir, verbose=self.verbose
+            record3d_image_filenames,
+            image_dir=image_dir,
+            verbose=self.verbose,
+            num_downscales=self.num_downscales,
         )
         num_frames = len(copied_image_paths)
 
@@ -100,9 +100,6 @@ class ProcessRecord3D(BaseConverterToNerfstudioDataset):
                 "To change the size of the dataset add the argument [yellow]--max_dataset_size[/yellow] to "
                 f"larger than the current value ({self.max_dataset_size}), or -1 to use all images."
             )
-
-        # Downscale images
-        summary_log.append(process_data_utils.downscale_images(image_dir, self.num_downscales, verbose=self.verbose))
 
         metadata_path = self.data / "metadata.json"
         record3d_utils.record3d_to_json(copied_image_paths, metadata_path, self.output_dir, indices=idx)
@@ -253,6 +250,8 @@ class ProcessMetashape(BaseConverterToNerfstudioDataset, _NoDefaultProcessMetash
             raise ValueError(f"XML file {self.xml} must have a .xml extension")
         if not self.xml.exists:
             raise ValueError(f"XML file {self.xml} doesn't exist")
+        if self.eval_data is not None:
+            raise ValueError("Cannot use eval_data since cameras were already aligned with Metashape.")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         image_dir = self.output_dir / "images"
@@ -266,6 +265,7 @@ class ProcessMetashape(BaseConverterToNerfstudioDataset, _NoDefaultProcessMetash
             image_filenames,
             image_dir=image_dir,
             verbose=self.verbose,
+            num_downscales=self.num_downscales,
         )
         num_frames = len(copied_image_paths)
 
@@ -282,9 +282,6 @@ class ProcessMetashape(BaseConverterToNerfstudioDataset, _NoDefaultProcessMetash
         else:
             summary_log.append(f"Started with {num_frames} images")
 
-        # Downscale images
-        summary_log.append(process_data_utils.downscale_images(image_dir, self.num_downscales, verbose=self.verbose))
-
         # Save json
         if num_frames == 0:
             CONSOLE.print("[bold red]No images found, exiting")
@@ -297,6 +294,184 @@ class ProcessMetashape(BaseConverterToNerfstudioDataset, _NoDefaultProcessMetash
                 verbose=self.verbose,
             )
         )
+
+        CONSOLE.rule("[bold green]:tada: :tada: :tada: All DONE :tada: :tada: :tada:")
+
+        for summary in summary_log:
+            CONSOLE.print(summary, justify="center")
+        CONSOLE.rule()
+
+
+@dataclass
+class _NoDefaultProcessRotatedMetashape:
+    """Private class to order the parameters of ProcessRotatedMetashape in the right order for default values."""
+
+    xml: Path
+    """Template path to the Metashape xml file."""
+    rotation_xml: Path
+    """Template path of the turntable rotated Metashape xml file"""
+    inner_outer_path: Path
+    """Path to the inner outer box"""
+
+
+@dataclass
+class ProcessRotatedMetashape(BaseConverterToNerfstudioDataset, _NoDefaultProcessRotatedMetashape):
+    """Process rotated Metashape data into a nerfstudio dataset.
+    """
+
+    num_downscales: int = 3
+    """Number of times to downscale the images. Downscales by 2 each time. For example a value of 3
+        will downscale the images by 2x, 4x, and 8x."""
+    start_downscale: int = 0
+    """Which level to start downscale"""
+    max_dataset_size: int = 600
+    """Max number of images to train on. If the dataset has more, images will be sampled approximately evenly. If -1,
+    use all images."""
+    rotation_names: List[str] = field(default_factory=lambda: ['0', '90', '180', '270'])
+    """Names of each rotation"""
+    inv_inner_name: Path = field(default_factory=lambda: Path('inv_inner_box_transform.txt'))
+    """Inv inner name"""
+    outer_aabb_name: Path = field(default_factory=lambda: Path('outer_box_aabb.txt'))
+    """Outer aabb name"""
+    extra_data: List[Path] = field(default_factory=lambda: [])
+    """Extra data"""
+    keep_image_name: bool = False
+    """Whether use frame number of keep image name"""
+    use_symlink: bool = False
+    """Use symlink instead of copy to speed up"""
+    skip_copy: bool = False
+    """Skip copy to speed up"""
+
+    def main(self) -> None:
+        """Process images into a nerfstudio dataset."""
+
+        if self.xml.suffix != ".xml":
+            raise ValueError(f"XML file {self.xml} must have a .xml extension")
+        if self.rotation_xml.suffix != ".xml":
+            raise ValueError(f"XML file {self.rotation_xml} must have a .xml extension")
+        for rotation_name in self.rotation_names:
+            if not Path(str(self.xml).format(rotation_name)).exists:
+                raise ValueError(f"XML file {Path(str(self.xml).format(rotation_name))} doesn't exist")
+            if not Path(str(self.rotation_xml).format(rotation_name)).exists:
+                raise ValueError(f"XML file {Path(str(self.rotation_xml).format(rotation_name))} doesn't exist")
+        if not (self.inner_outer_path / self.inv_inner_name).exists():
+            raise ValueError(f"{self.inner_outer_path / self.inv_inner_name} doesn't exist")
+        if not (self.inner_outer_path / self.outer_aabb_name).exists():
+            raise ValueError(f"{self.inner_outer_path / self.outer_aabb_name} doesn't exist")
+        if self.eval_data is not None:
+            raise ValueError("Cannot use eval_data since cameras were already aligned with Metashape.")
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        image_dir = self.output_dir / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        summary_log = []
+
+        num_frames = 0
+        image_filename_map = {}
+        data_sources = [(x, f'env_{i:03d}') for i, x in enumerate(self.extra_data)]
+        data_sources.extend([(Path(str(self.data).format(rotation_name)), f'rotation_{int(rotation_name):03d}')
+                             for rotation_name in self.rotation_names])
+        for i, (data_source, source_name) in enumerate(data_sources):
+            # Copy images to output directory
+            image_filenames, num_orig_images = process_data_utils.get_image_filenames(
+                data_source, self.max_dataset_size)
+            copied_image_paths = process_data_utils.copy_images_list(
+                image_filenames,
+                image_dir=image_dir,
+                verbose=self.verbose,
+                num_downscales=self.num_downscales,
+                keep_image_dir=i > 0 or self.skip_copy,
+                keep_image_name=self.keep_image_name,
+                image_prefix=f'{source_name}_',
+                start_downscale=self.start_downscale,
+                use_symlink=self.use_symlink,
+                skip_copy=self.skip_copy,
+            )
+            num_frames += len(copied_image_paths)
+
+            copied_image_paths = [Path("images/" + copied_image_path.name) for copied_image_path in copied_image_paths]
+            original_names = []
+            for image_path in image_filenames:
+                degree_match = re.search(r"(\d+)(degree)",  str(image_path.parent))
+
+                if degree_match:
+                    rotation_degree = degree_match.group(0)
+                degree_original_name_key = f'{image_path.stem}_{rotation_degree}'
+                original_names.append(degree_original_name_key)
+            image_filename_map.update(dict(zip(original_names, copied_image_paths)))
+
+        if self.max_dataset_size > 0 and num_frames != num_orig_images:
+            summary_log.append(f"Started with {num_frames} images out of {num_orig_images} total")
+            summary_log.append(
+                "To change the size of the dataset add the argument [yellow]--max_dataset_size[/yellow] to "
+                f"larger than the current value ({self.max_dataset_size}), or -1 to use all images."
+            )
+        else:
+            summary_log.append(f"Started with {num_frames} images")
+
+        # Save json
+        if num_frames == 0:
+            CONSOLE.print("[bold red]No images found, exiting")
+            sys.exit(1)
+
+        inv_inner_box_transform = np.loadtxt(self.inner_outer_path / self.inv_inner_name)
+        outer_box_aabb = np.loadtxt(self.inner_outer_path / self.outer_aabb_name)
+
+        import json
+        res = None
+        rotations = {}
+        internal_output_path = self.output_dir / 'internal_transforms'
+        internal_output_path.mkdir(exist_ok=True)
+        for i, rotation_name in enumerate(self.rotation_names):
+            summary_log.extend(
+                metashape_utils.metashape_to_json(
+                    image_filename_map=image_filename_map,
+                    xml_filename=Path(str(self.xml).format(rotation_name)),
+                    output_dir=internal_output_path,
+                    verbose=self.verbose,
+                    output_name=f'transforms_{rotation_name}.json',
+                    extra_transform=inv_inner_box_transform,
+                    no_conversion=True,
+                    rotation_name=rotation_name,
+                )
+            )
+            this_xml = json.load(open(internal_output_path / f'transforms_{rotation_name}.json'))
+            summary_log.extend(
+                metashape_utils.metashape_to_json(
+                    image_filename_map=image_filename_map,
+                    xml_filename=Path(str(self.rotation_xml).format(rotation_name)),
+                    output_dir=internal_output_path,
+                    verbose=self.verbose,
+                    output_name=f'transforms_{rotation_name}_rotated.json',
+                    extra_transform=inv_inner_box_transform,
+                    no_conversion=True,
+                    rotation_name=rotation_name,
+                )
+            )
+            this_rotation_xml = json.load(open(internal_output_path / f'transforms_{rotation_name}_rotated.json'))
+            for frame in this_xml['frames']:
+                frame['rotation'] = rotation_name
+            if i == 0:
+                res = this_xml
+            else:
+                if res['camera_model'] != this_xml['camera_model']:
+                    raise ValueError(f'Incompatible camera model: {res["camera_model"]} and {this_xml["camera_model"]}')
+                res['frames'].extend(this_xml['frames'])
+            before_rotate_frame = this_xml['frames'][0]
+            after_rotated_frame = this_rotation_xml['frames'][0]
+            if before_rotate_frame['file_path'] != after_rotated_frame['file_path']:
+                raise ValueError(
+                    f'file_path mismatch: {before_rotate_frame["file_path"]} and {after_rotated_frame["file_path"]}')
+            before_transformation = np.array(before_rotate_frame['transform_matrix'])
+            after_transformation = np.array(after_rotated_frame['transform_matrix'])
+            transform_matrix = before_transformation @ np.linalg.inv(after_transformation)
+            rotations[rotation_name] = transform_matrix.tolist()
+        res['rotations'] = rotations
+        res['rotation_aabb'] = outer_box_aabb.tolist()
+
+        with open(self.output_dir / 'transforms.json', "w", encoding="utf-8") as f:
+            json.dump(res, f, indent=4)
 
         CONSOLE.rule("[bold green]:tada: :tada: :tada: All DONE :tada: :tada: :tada:")
 
@@ -340,6 +515,8 @@ class ProcessRealityCapture(BaseConverterToNerfstudioDataset, _NoDefaultProcessR
             raise ValueError(f"CSV file {self.csv} must have a .csv extension")
         if not self.csv.exists:
             raise ValueError(f"CSV file {self.csv} doesn't exist")
+        if self.eval_data is not None:
+            raise ValueError("Cannot use eval_data since cameras were already aligned with RealityCapture.")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         image_dir = self.output_dir / "images"
@@ -353,6 +530,7 @@ class ProcessRealityCapture(BaseConverterToNerfstudioDataset, _NoDefaultProcessR
             image_filenames,
             image_dir=image_dir,
             verbose=self.verbose,
+            num_downscales=self.num_downscales,
         )
         num_frames = len(copied_image_paths)
 
@@ -368,9 +546,6 @@ class ProcessRealityCapture(BaseConverterToNerfstudioDataset, _NoDefaultProcessR
             )
         else:
             summary_log.append(f"Started with {num_frames} images")
-
-        # Downscale images
-        summary_log.append(process_data_utils.downscale_images(image_dir, self.num_downscales, verbose=self.verbose))
 
         # Save json
         if num_frames == 0:
@@ -396,6 +571,7 @@ Commands = Union[
     Annotated[VideoToNerfstudioDataset, tyro.conf.subcommand(name="video")],
     Annotated[ProcessPolycam, tyro.conf.subcommand(name="polycam")],
     Annotated[ProcessMetashape, tyro.conf.subcommand(name="metashape")],
+    Annotated[ProcessRotatedMetashape, tyro.conf.subcommand(name="rotated-metashape")],
     Annotated[ProcessRealityCapture, tyro.conf.subcommand(name="realitycapture")],
     Annotated[ProcessRecord3D, tyro.conf.subcommand(name="record3d")],
 ]

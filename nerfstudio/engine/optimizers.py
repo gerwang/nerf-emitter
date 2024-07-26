@@ -41,6 +41,8 @@ class OptimizerConfig(base_config.PrintableConfig):
     """The epsilon value to use."""
     max_norm: Optional[float] = None
     """The max norm to use for gradient clipping."""
+    max_value: Optional[float] = None
+    """The max value to use for gradient clipping."""
 
     # TODO: somehow make this more generic. i dont like the idea of overriding the setup function
     # but also not sure how to go about passing things into predefined torch objects.
@@ -49,6 +51,7 @@ class OptimizerConfig(base_config.PrintableConfig):
         kwargs = vars(self).copy()
         kwargs.pop("_target")
         kwargs.pop("max_norm")
+        kwargs.pop('max_value')
         return self._target(params, **kwargs)
 
 
@@ -108,7 +111,7 @@ class Optimizers:
         Args:
             param_group_name: name of scheduler to step forward
         """
-        if self.config.param_group_name.scheduler:  # type: ignore
+        if "scheduler" in self.config[param_group_name]:
             self.schedulers[param_group_name].step()
 
     def zero_grad_all(self) -> None:
@@ -124,9 +127,13 @@ class Optimizers:
         """
         for param_group, optimizer in self.optimizers.items():
             max_norm = self.config[param_group]["optimizer"].max_norm
-            if max_norm is not None:
+            max_value = self.config[param_group]["optimizer"].max_value
+            if max_norm is not None or max_value is not None:
                 grad_scaler.unscale_(optimizer)
+            if max_norm is not None:
                 torch.nn.utils.clip_grad_norm_(self.parameters[param_group], max_norm)
+            if max_value is not None:
+                torch.nn.utils.clip_grad_value_(self.parameters[param_group], max_value)
             if any(any(p.grad is not None for p in g["params"]) for g in optimizer.param_groups):
                 grad_scaler.step(optimizer)
 
@@ -135,8 +142,11 @@ class Optimizers:
         for param_group, optimizer in self.optimizers.items():
             # note that they key is the parameter name
             max_norm = self.config[param_group]["optimizer"].max_norm
+            max_value = self.config[param_group]["optimizer"].max_value
             if max_norm is not None:
                 torch.nn.utils.clip_grad_norm_(self.parameters[param_group], max_norm)
+            if max_value is not None:
+                torch.nn.utils.clip_grad_value_(self.parameters[param_group], max_value)
             optimizer.step()
 
     def scheduler_step_all(self, step: int) -> None:
@@ -159,3 +169,12 @@ class Optimizers:
         """
         for k, v in loaded_state.items():
             self.optimizers[k].load_state_dict(v)
+
+    def load_schedulers(self, loaded_state: Dict[str, Any]) -> None:
+        """Helper to load the scheduler state from previous checkpoint
+
+        Args:
+            loaded_state: the state from the previous checkpoint
+        """
+        for k, v in loaded_state.items():
+            self.schedulers[k].load_state_dict(v)

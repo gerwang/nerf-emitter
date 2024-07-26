@@ -120,6 +120,8 @@ class ExponentialDecayScheduler(Scheduler):
             lr_final = self.config.lr_final
 
         def func(step):
+            if lr_init == 0:
+                return 1.0
             if step < self.config.warmup_steps:
                 if self.config.ramp == "cosine":
                     lr = self.config.lr_pre_warmup + (lr_init - self.config.lr_pre_warmup) * np.sin(
@@ -136,6 +138,56 @@ class ExponentialDecayScheduler(Scheduler):
                 )
                 lr = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
             return lr / lr_init  # divided by lr_init because the multiplier is with the initial learning rate
+
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=func)
+        return scheduler
+
+
+@dataclass
+class ExponentialDecayStepSchedulerConfig(ExponentialDecaySchedulerConfig):
+    """Config for exponential decay scheduler with warmup"""
+
+    _target: Type = field(default_factory=lambda: ExponentialDecayStepScheduler)
+    """target class to instantiate"""
+    step_pretrain: Optional[int] = 0
+    lr_lambda: Optional[float] = 1.0
+
+
+class ExponentialDecayStepScheduler(ExponentialDecayScheduler):
+    """Exponential decay scheduler with linear warmup. Scheduler first ramps up to `lr_init` in `warmup_steps`
+    steps, then exponentially decays to `lr_final` in `max_steps` steps.
+    """
+
+    config: ExponentialDecayStepSchedulerConfig
+
+    def get_scheduler(self, optimizer: Optimizer, lr_init: float) -> LRScheduler:
+        if self.config.lr_final is None:
+            lr_final = lr_init
+        else:
+            lr_final = self.config.lr_final
+
+        def func(step):
+            if lr_init == 0:
+                return 1.0
+            if step < self.config.warmup_steps:
+                if self.config.ramp == "cosine":
+                    lr = self.config.lr_pre_warmup + (lr_init - self.config.lr_pre_warmup) * np.sin(
+                        0.5 * np.pi * np.clip(step / self.config.warmup_steps, 0, 1)
+                    )
+                else:
+                    lr = (
+                        self.config.lr_pre_warmup
+                        + (lr_init - self.config.lr_pre_warmup) * step / self.config.warmup_steps
+                    )
+            else:
+                t = np.clip(
+                    (step - self.config.warmup_steps) / (self.config.max_steps - self.config.warmup_steps), 0, 1
+                )
+                lr = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
+            res = lr / lr_init  # divided by lr_init because the multiplier is with the initial learning rate
+            if step + 1 >= self.config.step_pretrain:
+                res *= self.config.lr_lambda
+            return res
 
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=func)
         return scheduler
@@ -167,6 +219,8 @@ class CosineDecayScheduler(Scheduler):
             else:
                 alpha = self.config.learning_rate_alpha
                 progress = (step - self.config.warm_up_end) / (self.config.max_steps - self.config.warm_up_end)
+                if progress > 1.:
+                    progress = 1.
                 learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
             return learning_factor
 

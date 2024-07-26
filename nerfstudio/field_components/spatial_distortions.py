@@ -22,6 +22,7 @@ from functorch import jacrev, vmap
 from jaxtyping import Float
 from torch import Tensor, nn
 
+from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.utils.math import Gaussians
 
 
@@ -88,3 +89,15 @@ class SceneContraction(SpatialDistortion):
             return Gaussians(mean=means, cov=cov)
 
         return contract(positions)
+
+
+class FakeContraction(SpatialDistortion):
+    """Normalize specified bound to [-2, 2]
+    """
+
+    def __init__(self, aabb: Float[Tensor, "2 3"]) -> None:
+        super().__init__()
+        self.register_buffer('aabb', aabb)
+
+    def forward(self, positions):
+        return SceneBox.get_normalized_positions(positions, self.aabb) * 4 - 2

@@ -76,6 +76,7 @@ class ControlPanel:
         self._normalize = ViewerCheckbox("Normalize", True, cb_hook=rerender_cb, hint="Normalize the colormap")
         self._min = ViewerNumber("Min", 0.0, cb_hook=rerender_cb, hint="Min value of the colormap")
         self._max = ViewerNumber("Max", 1.0, cb_hook=rerender_cb, hint="Max value of the colormap")
+        self._tone_mapping = ViewerCheckbox("ToneMapping", False, cb_hook=rerender_cb, hint="Tone mapping")
 
         self._split = ViewerCheckbox(
             "Enable",
@@ -108,6 +109,12 @@ class ControlPanel:
         )
         self._split_max = ViewerNumber(
             "Max ", 1.0, cb_hook=rerender_cb, hint="Max value of the colormap of the second output"
+        )
+        self._split_tone_mapping = ViewerCheckbox(
+            "ToneMapping", False, cb_hook=rerender_cb, hint="Tone mapping of the second output"
+        )
+        self._split_rotation = ViewerDropdown(
+            "Rotation", "0", ["0"], cb_hook=rerender_cb, hint="Rotation state of the turntable"
         )
 
         self._train_util = ViewerSlider(
@@ -145,7 +152,9 @@ class ControlPanel:
             self.add_element(self._max_res)
             self.add_element(self._output_render)
             self.add_element(self._colormap)
+            self.add_element(self._split_rotation)
             # colormap options
+            self.add_element(self._tone_mapping)
             with self.viser_server.gui_folder(" "):
                 self.add_element(self._invert, additional_tags=("colormap",))
                 self.add_element(self._normalize, additional_tags=("colormap",))
@@ -159,6 +168,7 @@ class ControlPanel:
             self.add_element(self._split_percentage, additional_tags=("split",))
             self.add_element(self._split_output_render, additional_tags=("split",))
             self.add_element(self._split_colormap, additional_tags=("split",))
+            self.add_element(self._split_tone_mapping, additional_tags=("split",))
             with self.viser_server.gui_folder("  "):
                 self.add_element(self._split_invert, additional_tags=("split_colormap",))
                 self.add_element(self._split_normalize, additional_tags=("split_colormap",))
@@ -223,6 +233,7 @@ class ControlPanel:
         self._split_percentage.set_hidden(not self._split.value)
         self._split_output_render.set_hidden(not self._split.value)
         self._split_colormap.set_hidden(not self._split.value)
+        self._split_tone_mapping.set_hidden(not self._split.value)
         self._split_colormap.set_disabled(self.split_output_render == "rgb")
 
     def update_colormap_options(self, dimensions: int, dtype: type) -> None:
@@ -242,6 +253,9 @@ class ControlPanel:
             dtype: the data type of the render
         """
         self._split_colormap.set_options(_get_colormap_options(dimensions, dtype))
+
+    def update_rotation_options(self, options: List[str]):
+        self._split_rotation.set_options(options)
 
     @property
     def output_render(self) -> str:
@@ -332,6 +346,7 @@ class ControlPanel:
             colormap_min=self._min.value,
             colormap_max=self._max.value,
             invert=self._invert.value,
+            tone_mapping=self._tone_mapping.value,
         )
 
     @property
@@ -343,7 +358,12 @@ class ControlPanel:
             colormap_min=self._split_min.value,
             colormap_max=self._split_max.value,
             invert=self._split_invert.value,
+            tone_mapping=self._split_tone_mapping.value,
         )
+
+    @property
+    def rotation_option(self) -> str:
+        return self._split_rotation.value
 
 
 def _get_colormap_options(dimensions: int, dtype: type) -> List[Colormaps]:

@@ -37,6 +37,8 @@ def human_format(num):
     Args:
         num: number to format
     """
+    if num == 0:
+        return f"{num} "
     units = ["", "K", "M", "B", "T", "P"]
     k = 1000.0
     magnitude = int(floor(log(num, k)))

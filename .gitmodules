@@ -1,0 +1,3 @@
+[submodule "differentiable-sdf-rendering"]
+	path = differentiable-sdf-rendering
+	url = https://github.com/gerwang/diff-sdf.git

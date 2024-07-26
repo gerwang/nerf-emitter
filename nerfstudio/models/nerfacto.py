@@ -24,14 +24,15 @@ from typing import Dict, List, Literal, Tuple, Type
 import numpy as np
 import torch
 from torch.nn import Parameter
-from torchmetrics import PeakSignalNoiseRatio
+from torchmetrics import MeanAbsolutePercentageError
 from torchmetrics.functional import structural_similarity_index_measure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image import PeakSignalNoiseRatio, LearnedPerceptualImagePatchSimilarity
 
 from nerfstudio.cameras.rays import RayBundle, RaySamples
+from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.field_components.field_heads import FieldHeadNames
-from nerfstudio.field_components.spatial_distortions import SceneContraction
+from nerfstudio.field_components.spatial_distortions import SceneContraction, FakeContraction
 from nerfstudio.fields.density_fields import HashMLPDensityField
 from nerfstudio.fields.nerfacto_field import NerfactoField
 from nerfstudio.model_components.losses import (
@@ -40,15 +41,19 @@ from nerfstudio.model_components.losses import (
     interlevel_loss,
     orientation_loss,
     pred_normal_loss,
-    scale_gradients_by_distance_squared,
+    scale_gradients_by_distance_squared, RawNeRFLoss, L1Loss, RelativeL1Loss, pred_gradient_loss, RelativeMaxL1Loss,
 )
 from nerfstudio.model_components.ray_samplers import ProposalNetworkSampler, UniformSampler
 from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, NormalsRenderer, RGBRenderer
-from nerfstudio.model_components.scene_colliders import NearFarCollider
+from nerfstudio.model_components.scene_colliders import NearFarCollider, AABBBoxCollider, AABBBoxIntersectCollider, \
+    AABBBoxFarIntersectCollider
 from nerfstudio.model_components.shaders import NormalsShader
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps
+from nerfstudio.utils.colormaps import linear_to_srgb_torch
 
+
+# from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 @dataclass
 class NerfactoModelConfig(ModelConfig):
@@ -70,7 +75,7 @@ class NerfactoModelConfig(ModelConfig):
     num_levels: int = 16
     """Number of levels of the hashmap for the base mlp."""
     base_res: int = 16
-    """Resolution of the base grid for the hasgrid."""
+    """Resolution of the base grid for the hashgrid."""
     max_res: int = 2048
     """Maximum resolution of the hashmap for the base mlp."""
     log2_hashmap_size: int = 19
@@ -124,8 +129,32 @@ class NerfactoModelConfig(ModelConfig):
     """Use gradient scaler where the gradients are lower for points closer to the camera."""
     implementation: Literal["tcnn", "torch"] = "tcnn"
     """Which implementation to use for the model."""
+    color_output_activation: Literal['Sigmoid', 'RawNeRF'] = 'Sigmoid'
+    """The output activation of color, depending sRGB or Linear color space"""
+    rgb_loss_type: Literal["l2", "l1", "relative_l2", "relative_l1", "relative_max_l1"] = 'l2'
+    """Whether use the rawnerf loss for HDR images"""
+    rgb_bias: float = -5
+    """RGB activation we use for linear color outputs is exp(x - 5)"""
     appearance_embed_dim: int = 32
     """Dimension of the appearance embedding."""
+    hdr: bool = True
+    """Use hdr in RGB Renderer"""
+    train_stratified: bool = True
+    """Whether enable randomness in proposal sampling"""
+    use_fake_contraction: bool = False
+    """Whether to use fake contraction"""
+    fake_bounding_box_min: Tuple[float, float, float] = (-1, -1, -1)
+    """Minimum of the bounding box, used if use_fake_contraction is True."""
+    fake_bounding_box_max: Tuple[float, float, float] = (1, 1, 1)
+    """Maximum of the bounding box, used if use_fake_contraction is True."""
+    disable_aabb_at_start: bool = False
+    """Disable density inside aabb at the beginning of training"""
+    visualize_xyz_gradient: bool = False
+    """Visualize xyz gradient, should be disabled in training"""
+    far_intersect: bool = False
+    """Set near to far-epsilon"""
+    eval_use_mask: bool = False
+    """Only calculate loss at masked region"""
 
 
 class NerfactoModel(Model):
@@ -140,27 +169,41 @@ class NerfactoModel(Model):
     def populate_modules(self):
         """Set the fields and modules."""
         super().populate_modules()
+        # self.config.visualize_xyz_gradient = True
 
         if self.config.disable_scene_contraction:
             scene_contraction = None
+        elif self.config.use_fake_contraction:
+            scene_contraction = FakeContraction(aabb=torch.tensor([
+                self.config.fake_bounding_box_min,
+                self.config.fake_bounding_box_max,
+            ]))
         else:
             scene_contraction = SceneContraction(order=float("inf"))
 
         # Fields
+        num_images = self.num_train_data
+        if self.rotater is not None:
+            num_images = self.rotater.num_rotations()
         self.field = NerfactoField(
             self.scene_box.aabb,
             hidden_dim=self.config.hidden_dim,
             num_levels=self.config.num_levels,
             max_res=self.config.max_res,
+            base_res=self.config.base_res,
+            features_per_level=self.config.features_per_level,
             log2_hashmap_size=self.config.log2_hashmap_size,
             hidden_dim_color=self.config.hidden_dim_color,
             hidden_dim_transient=self.config.hidden_dim_transient,
             spatial_distortion=scene_contraction,
-            num_images=self.num_train_data,
+            num_images=num_images,
             use_pred_normals=self.config.predict_normals,
             use_average_appearance_embedding=self.config.use_average_appearance_embedding,
+            color_output_activation=self.config.color_output_activation,
+            rgb_bias=self.config.rgb_bias,
             appearance_embedding_dim=self.config.appearance_embed_dim,
             implementation=self.config.implementation,
+            always_use_camera_indices=self.rotater is not None,
         )
 
         self.density_fns = []
@@ -201,7 +244,8 @@ class NerfactoModel(Model):
         # Change proposal network initial sampler if uniform
         initial_sampler = None  # None is for piecewise as default (see ProposalNetworkSampler)
         if self.config.proposal_initial_sampler == "uniform":
-            initial_sampler = UniformSampler(single_jitter=self.config.use_single_jitter)
+            initial_sampler = UniformSampler(single_jitter=self.config.use_single_jitter,
+                                             train_stratified=self.config.train_stratified)
 
         self.proposal_sampler = ProposalNetworkSampler(
             num_nerf_samples_per_ray=self.config.num_nerf_samples_per_ray,
@@ -210,27 +254,61 @@ class NerfactoModel(Model):
             single_jitter=self.config.use_single_jitter,
             update_sched=update_schedule,
             initial_sampler=initial_sampler,
+            train_stratified=self.config.train_stratified,
         )
 
         # Collider
-        self.collider = NearFarCollider(near_plane=self.config.near_plane, far_plane=self.config.far_plane)
+        if self.config.disable_scene_contraction:
+            self.collider = AABBBoxCollider(scene_box=self.scene_box)
+        elif self.config.use_fake_contraction:
+            self.collider = AABBBoxIntersectCollider(scene_box=SceneBox(scene_contraction.aabb))
+        else:
+            self.collider = NearFarCollider(near_plane=self.config.near_plane, far_plane=self.config.far_plane)
+
+        self.far_intersect_collider = None
+        if self.config.far_intersect:
+            self.far_intersect_collider = AABBBoxFarIntersectCollider(scene_box=self.scene_box)
 
         # renderers
-        self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
+        self.renderer_rgb = RGBRenderer(background_color=self.config.background_color, hdr=self.config.hdr)
         self.renderer_accumulation = AccumulationRenderer()
-        self.renderer_depth = DepthRenderer()
+        self.renderer_depth = DepthRenderer(method="median")
+        self.renderer_expected_depth = DepthRenderer(method="expected")
         self.renderer_normals = NormalsRenderer()
 
         # shaders
         self.normals_shader = NormalsShader()
 
         # losses
-        self.rgb_loss = MSELoss()
+        self.rgb_loss = {
+            'l2': MSELoss,
+            'relative_l2': RawNeRFLoss,
+            'l1': L1Loss,
+            'relative_l1': RelativeL1Loss,
+            'relative_max_l1': RelativeMaxL1Loss,
+        }[self.config.rgb_loss_type]()
 
         # metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
+        self.mape = MeanAbsolutePercentageError()
+        self.step = 0
+
+        if self.config.disable_aabb_at_start:
+            self.set_disable_aabb(True)
+
+    def mock_aabb(self, aabb_scale:float):
+        self.field.aabb[0] = -aabb_scale
+        self.field.aabb[1] = aabb_scale
+        for network in self.proposal_networks:
+            network.aabb[0] = -aabb_scale
+            network.aabb[1] = aabb_scale
+
+    def set_disable_aabb(self, flag):
+        self.field.disable_inside_aabb = flag
+        for network in self.proposal_networks:
+            network.disable_inside_aabb = flag
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
@@ -249,6 +327,7 @@ class NerfactoModel(Model):
             def set_anneal(step):
                 # https://arxiv.org/pdf/2111.12077.pdf eq. 18
                 train_frac = np.clip(step / N, 0, 1)
+                self.step = step
 
                 def bias(x, b):
                     return b * x / ((b - 1) * x + 1)
@@ -273,8 +352,12 @@ class NerfactoModel(Model):
         return callbacks
 
     def get_outputs(self, ray_bundle: RayBundle):
+        if self.config.far_intersect:
+            ray_bundle = self.far_intersect_collider(ray_bundle)
         ray_samples: RaySamples
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        if self.rotater is not None:
+            ray_samples.camera_indices = self.rotater.map_rotation_ids(ray_samples.camera_indices)
         field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
         if self.config.use_gradient_scaling:
             field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
@@ -284,13 +367,16 @@ class NerfactoModel(Model):
         ray_samples_list.append(ray_samples)
 
         rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
-        depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+        with torch.no_grad():
+            depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+        expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
         accumulation = self.renderer_accumulation(weights=weights)
 
         outputs = {
             "rgb": rgb,
             "accumulation": accumulation,
             "depth": depth,
+            "expected_depth": expected_depth,
         }
 
         if self.config.predict_normals:
@@ -298,6 +384,7 @@ class NerfactoModel(Model):
             pred_normals = self.renderer_normals(field_outputs[FieldHeadNames.PRED_NORMALS], weights=weights)
             outputs["normals"] = self.normals_shader(normals)
             outputs["pred_normals"] = self.normals_shader(pred_normals)
+
         # These use a lot of GPU memory, so we avoid storing them for eval.
         if self.training:
             outputs["weights_list"] = weights_list
@@ -314,6 +401,14 @@ class NerfactoModel(Model):
                 field_outputs[FieldHeadNames.PRED_NORMALS],
             )
 
+        if self.config.visualize_xyz_gradient:
+            rgb_weights = torch.tensor([0.299, 0.587, 0.114], device=self.device, dtype=torch.float32)
+            brightness_grad, lum, _, _ = self.calc_brightness_grad(ray_bundle, ray_samples, rgb_weights)
+            brightness_grads = brightness_grad.split([1, 1, 1], dim=-1)
+            outputs['luminance'] = (rgb * rgb_weights).sum(dim=-1, keepdim=True)
+            for axis_name, brightness_grad in zip(['x','y','z'], brightness_grads):
+                outputs[f'brightness_grad_{axis_name}'] = brightness_grad
+
         for i in range(self.config.num_proposal_iterations):
             outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
 
@@ -321,8 +416,19 @@ class NerfactoModel(Model):
 
     def get_metrics_dict(self, outputs, batch):
         metrics_dict = {}
-        image = batch["image"].to(self.device)
-        metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
+        gt_rgb = batch["image"].to(self.device)  # RGB or RGBA image
+        gt_rgb = self.renderer_rgb.blend_background(gt_rgb)  # Blend if RGBA
+        predicted_rgb = outputs["rgb"]
+        if self.config.hdr:
+            srgb_predicted_rgb = linear_to_srgb_torch(predicted_rgb)
+            srgb_gt_rgb = linear_to_srgb_torch(gt_rgb)
+        else:
+            srgb_predicted_rgb = predicted_rgb
+            srgb_gt_rgb = gt_rgb
+        metrics_dict["psnr"] = self.psnr(srgb_predicted_rgb, srgb_gt_rgb)
+
+        metrics_dict["mape"] = self.mape(predicted_rgb, gt_rgb)
+
         if self.training:
             metrics_dict["distortion"] = distortion_loss(outputs["weights_list"], outputs["ray_samples_list"])
         return metrics_dict
@@ -330,7 +436,13 @@ class NerfactoModel(Model):
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = {}
         image = batch["image"].to(self.device)
-        loss_dict["rgb_loss"] = self.rgb_loss(image, outputs["rgb"])
+        pred_rgb, gt_rgb = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb"],
+            pred_accumulation=outputs["accumulation"],
+            gt_image=image,
+        )
+
+        loss_dict["rgb_loss"] = self.rgb_loss(pred_rgb, gt_rgb)  # input, target
         if self.training:
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
                 outputs["weights_list"], outputs["ray_samples_list"]
@@ -352,38 +464,110 @@ class NerfactoModel(Model):
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        image = batch["image"].to(self.device)
-        rgb = outputs["rgb"]
-        acc = colormaps.apply_colormap(outputs["accumulation"])
-        depth = colormaps.apply_depth_colormap(
-            outputs["depth"],
-            accumulation=outputs["accumulation"],
-        )
+        gt_rgb = batch["image"].to(self.device)
+        predicted_rgb = outputs["rgb"]  # Blended with background (black if random background)
+        gt_rgb = self.renderer_rgb.blend_background(gt_rgb)
+        use_acc = "accumulation" in outputs
+        use_depth = "depth" in outputs and use_acc
+        if use_acc:
+            acc = colormaps.apply_colormap(outputs["accumulation"])
+        if use_depth:
+            depth = colormaps.apply_depth_colormap(
+                outputs["depth"],
+                accumulation=outputs["accumulation"],
+            )
 
-        combined_rgb = torch.cat([image, rgb], dim=1)
-        combined_acc = torch.cat([acc], dim=1)
-        combined_depth = torch.cat([depth], dim=1)
+        if self.config.hdr:
+            srgb_predicted_rgb = linear_to_srgb_torch(predicted_rgb)
+            srgb_gt_rgb = linear_to_srgb_torch(gt_rgb)
+        else:
+            srgb_predicted_rgb = predicted_rgb
+            srgb_gt_rgb = gt_rgb
+        srgb_gt_rgb = srgb_gt_rgb.clamp(0, 1)
+        combined_rgb = torch.cat([srgb_gt_rgb, srgb_predicted_rgb], dim=1)
+        if use_acc:
+            combined_acc = torch.cat([acc], dim=1)
+        if use_depth:
+            combined_depth = torch.cat([depth], dim=1)
+
+        masked_combined_rgb = None
+        mask = None
+        if self.config.eval_use_mask:
+            assert 'mask' in batch
+            mask = batch['mask'].to(self.device)
+            srgb_gt_rgb = srgb_gt_rgb * mask
+            srgb_predicted_rgb = srgb_predicted_rgb * mask
+            predicted_rgb = predicted_rgb * mask
+            gt_rgb = gt_rgb * mask
+            masked_combined_rgb = torch.cat([srgb_gt_rgb, srgb_predicted_rgb], dim=1)
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
-        image = torch.moveaxis(image, -1, 0)[None, ...]
-        rgb = torch.moveaxis(rgb, -1, 0)[None, ...]
+        def move_axis(x):
+            return torch.moveaxis(x, -1, 0)[None, ...]
 
-        psnr = self.psnr(image, rgb)
-        ssim = self.ssim(image, rgb)
-        lpips = self.lpips(image, rgb)
+        gt_rgb = move_axis(gt_rgb)
+        predicted_rgb = move_axis(predicted_rgb)
+        srgb_gt_rgb = move_axis(srgb_gt_rgb)
+        srgb_predicted_rgb = move_axis(srgb_predicted_rgb)
+
+        if self.config.eval_use_mask:
+            binary_mask = mask[..., 0] > 0.5
+            psnr = self.psnr(srgb_gt_rgb[..., binary_mask], srgb_predicted_rgb[..., binary_mask])
+        else:
+            psnr = self.psnr(srgb_gt_rgb, srgb_predicted_rgb)
+        ssim = self.ssim(srgb_gt_rgb, srgb_predicted_rgb)
+        lpips = self.lpips(srgb_gt_rgb, srgb_predicted_rgb)
+
+        mape = self.mape(predicted_rgb, gt_rgb)
 
         # all of these metrics will be logged as scalars
         metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
         metrics_dict["lpips"] = float(lpips)
+        metrics_dict["mape"] = float(mape)
 
-        images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
+        images_dict = {"img": combined_rgb, }
+        if use_acc:
+            images_dict.update({"accumulation": combined_acc, })
+        if use_depth:
+            images_dict.update({"depth": combined_depth, })
+        if self.config.eval_use_mask:
+            images_dict.update({"masked-img": masked_combined_rgb})
 
-        for i in range(self.config.num_proposal_iterations):
-            key = f"prop_depth_{i}"
-            prop_depth_i = colormaps.apply_depth_colormap(
-                outputs[key],
-                accumulation=outputs["accumulation"],
-            )
-            images_dict[key] = prop_depth_i
+        if use_acc:
+            for i in range(self.config.num_proposal_iterations):
+                key = f"prop_depth_{i}"
+                prop_depth_i = colormaps.apply_depth_colormap(
+                    outputs[key],
+                    accumulation=outputs["accumulation"],
+                )
+                images_dict[key] = prop_depth_i
 
         return metrics_dict, images_dict
+
+    def calc_brightness_grad(self, ray_bundle, ray_samples, rgb_weights):
+        with torch.enable_grad():
+            ray_bundle.origins.requires_grad = True
+            ray_samples.frustums.origins = ray_bundle.origins.unsqueeze(-2).expand_as(ray_samples.frustums.origins)
+            ray_samples.frustums.directions = ray_bundle.directions.unsqueeze(-2).expand_as(
+                ray_samples.frustums.directions)
+            if ray_bundle.rotater is not None:
+                ray_bundle.rotater(ray_samples.frustums, ray_bundle.camera_indices[..., None])
+
+            field_outputs = self.field(ray_samples, compute_normals=self.config.predict_normals)
+            if self.config.use_gradient_scaling:
+                field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
+
+            field_rgb = field_outputs[FieldHeadNames.RGB]
+            weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
+
+            rgb = self.renderer_rgb(rgb=field_rgb, weights=weights)
+            brightness = torch.sum(rgb * rgb_weights, dim=-1, keepdim=True)
+
+            d_output = torch.ones_like(brightness, requires_grad=False, device=brightness.device)
+            brightness_grad = torch.autograd.grad(
+                outputs=brightness,
+                inputs=ray_bundle.origins,
+                grad_outputs=d_output)[0]
+        rgb_detach = rgb.detach()
+        lum = torch.sum(field_rgb * rgb_weights, dim=-1, keepdim=True)
+        return brightness_grad, lum, rgb_detach, weights

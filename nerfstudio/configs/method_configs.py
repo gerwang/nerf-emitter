@@ -24,12 +24,11 @@ from typing import Dict
 import tyro
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
-from nerfstudio.configs.base_config import ViewerConfig
+from nerfstudio.configs.base_config import ViewerConfig, LoggingConfig
 from nerfstudio.configs.external_methods import get_external_methods
-
-from nerfstudio.data.datamanagers.random_cameras_datamanager import RandomCamerasDataManagerConfig
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, VanillaDataManagerConfig
-
+from nerfstudio.data.datamanagers.mitsuba_datamanager import MitsubaDataManagerConfig, MitsubaDataManager
+from nerfstudio.data.datamanagers.random_cameras_datamanager import RandomCamerasDataManagerConfig
 from nerfstudio.data.dataparsers.blender_dataparser import BlenderDataParserConfig
 from nerfstudio.data.dataparsers.dnerf_dataparser import DNeRFDataParserConfig
 from nerfstudio.data.dataparsers.instant_ngp_dataparser import InstantNGPDataParserConfig
@@ -38,35 +37,43 @@ from nerfstudio.data.dataparsers.phototourism_dataparser import PhototourismData
 from nerfstudio.data.dataparsers.sdfstudio_dataparser import SDFStudioDataParserConfig
 from nerfstudio.data.dataparsers.sitcoms3d_dataparser import Sitcoms3DDataParserConfig
 from nerfstudio.data.datasets.depth_dataset import DepthDataset
+from nerfstudio.data.datasets.occlusion_dataset import OcclusionDataset
 from nerfstudio.data.datasets.sdf_dataset import SDFDataset
 from nerfstudio.data.datasets.semantic_dataset import SemanticDataset
+from nerfstudio.data.pixel_samplers import PairPixelSamplerConfig, PixelSamplerConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig, RAdamOptimizerConfig
 from nerfstudio.engine.schedulers import (
     CosineDecaySchedulerConfig,
     ExponentialDecaySchedulerConfig,
-    MultiStepSchedulerConfig,
+    MultiStepSchedulerConfig, ExponentialDecayStepSchedulerConfig,
 )
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.field_components.temporal_distortions import TemporalDistortionKind
 from nerfstudio.fields.sdf_field import SDFFieldConfig
 from nerfstudio.models.depth_nerfacto import DepthNerfactoModelConfig
+from nerfstudio.models.dummy_model import DummyModelConfig
 from nerfstudio.models.generfacto import GenerfactoModelConfig
 from nerfstudio.models.instant_ngp import InstantNGPModelConfig
 from nerfstudio.models.mipnerf import MipNerfModel
 from nerfstudio.models.nerfacto import NerfactoModelConfig
 from nerfstudio.models.neus import NeuSModelConfig
 from nerfstudio.models.neus_facto import NeuSFactoModelConfig
+from nerfstudio.models.sdf_nerfacto import SdfNerfactoModelConfig
 from nerfstudio.models.semantic_nerfw import SemanticNerfWModelConfig
 from nerfstudio.models.tensorf import TensoRFModelConfig
 from nerfstudio.models.vanilla_nerf import NeRFModel, VanillaModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.pipelines.dynamic_batch import DynamicBatchPipelineConfig
+from nerfstudio.pipelines.mitsuba_sdf import MitsubaSdfPipelineConfig
 from nerfstudio.plugins.registry import discover_methods
 
 method_configs: Dict[str, TrainerConfig] = {}
 descriptions = {
     "nerfacto": "Recommended real-time model tuned for real captures. This model will be continually updated.",
     "depth-nerfacto": "Nerfacto with depth supervision.",
+    "hdr-nerfacto": "Nerfacto supporting hdr image inputs.",
+    "sdf-nerfacto": "Nerfacto supporting Mitsuba SDF.",
+    "sdf-gt-envmap": "Optimizing Mitsuba SDF given a ground truth environment map.",
     "volinga": "Real-time rendering model from Volinga. Directly exportable to NVOL format at https://volinga.ai/",
     "instant-ngp": "Implementation of Instant-NGP. Recommended real-time model for unbounded scenes.",
     "instant-ngp-bounded": "Implementation of Instant-NGP. Recommended for bounded real and synthetic scenes",
@@ -136,7 +143,6 @@ method_configs["nerfacto-big"] = TrainerConfig(
             hidden_dim=128,
             hidden_dim_color=128,
             appearance_embed_dim=128,
-            base_res=32,
             max_res=4096,
             proposal_weights_anneal_max_num_iters=5000,
             log2_hashmap_size=21,
@@ -183,8 +189,6 @@ method_configs["nerfacto-huge"] = TrainerConfig(
             hidden_dim=256,
             hidden_dim_color=256,
             appearance_embed_dim=32,
-            features_per_level=4,
-            base_res=32,
             max_res=8192,
             proposal_weights_anneal_max_num_iters=5000,
             log2_hashmap_size=21,
@@ -213,6 +217,7 @@ method_configs["depth-nerfacto"] = TrainerConfig(
     pipeline=VanillaPipelineConfig(
         datamanager=VanillaDataManagerConfig(
             _target=VanillaDataManager[DepthDataset],
+            pixel_sampler=PairPixelSamplerConfig(),
             dataparser=NerfstudioDataParserConfig(),
             train_num_rays_per_batch=4096,
             eval_num_rays_per_batch=4096,
@@ -233,6 +238,144 @@ method_configs["depth-nerfacto"] = TrainerConfig(
         },
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    vis="viewer",
+)
+
+method_configs["hdr-nerfacto"] = TrainerConfig(
+    method_name="hdr-nerfacto",
+    steps_per_eval_batch=50,
+    steps_per_save=200,
+    max_num_iterations=2000,
+    mixed_precision=True,
+    pipeline=VanillaPipelineConfig(
+        datamanager=VanillaDataManagerConfig(
+            dataparser=NerfstudioDataParserConfig(),
+            train_num_rays_per_batch=1 << 15,
+            eval_num_rays_per_batch=1 << 15,
+            camera_optimizer=CameraOptimizerConfig(
+                mode="off",
+                optimizer=RAdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-3),
+                scheduler=ExponentialDecaySchedulerConfig(lr_final=6e-6, max_steps=200000),
+            ),
+            images_on_gpu=True,
+        ),
+        model=NerfactoModelConfig(
+            eval_num_rays_per_chunk=1 << 15,
+            color_output_activation='RawNeRF',
+            rgb_loss_type='relative_l1',
+            appearance_embed_dim=0,
+            distortion_loss_mult=7e-3,
+            hdr=True,
+            proposal_update_every=1,
+            proposal_warmup=300,
+            proposal_weights_anneal_max_num_iters=100,
+        ),
+    ),
+    optimizers={
+        "proposal_networks": {
+            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=0.1, max_value=0.1),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20000),
+        },
+        "fields": {
+            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=0.1, max_value=0.1),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20000),
+        },
+    },
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    vis="viewer",
+)
+
+PRETRAIN_ITER = 2000
+MI_OPT_ITER = 320
+
+method_configs["sdf-nerfacto"] = TrainerConfig(
+    method_name="sdf-nerfacto",
+    steps_per_eval_batch=50,
+    steps_per_save=200,
+    max_num_iterations=PRETRAIN_ITER + MI_OPT_ITER,
+    mixed_precision=True,
+    write_mi_model_outputs=True,
+    pipeline=MitsubaSdfPipelineConfig(
+        datamanager=MitsubaDataManagerConfig(
+            _target=MitsubaDataManager[OcclusionDataset],
+            dataparser=NerfstudioDataParserConfig(),
+            train_num_rays_per_batch=1 << 14,
+            eval_num_rays_per_batch=1 << 14,
+            camera_optimizer=CameraOptimizerConfig(
+                mode="off",
+                optimizer=RAdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-3),
+                scheduler=ExponentialDecaySchedulerConfig(lr_final=6e-6, max_steps=200000),
+            ),
+            pixel_sampler=PixelSamplerConfig(
+                masked_sampling=False,
+            ),
+            images_on_gpu=True,
+        ),
+        model=SdfNerfactoModelConfig(
+            backward_num_rays_per_chunk=1 << 14,
+            eval_num_rays_per_chunk=1 << 14,
+            color_output_activation='RawNeRF',
+            rgb_loss_type='relative_l1',
+            appearance_embed_dim=32,
+            distortion_loss_mult=7e-3,
+            hdr=True,
+            proposal_update_every=1,
+            proposal_warmup=300,
+            proposal_weights_anneal_max_num_iters=100,
+            use_gradient_scaling=True,
+        ),
+        override_trainer_config=True,
+        takeover_step=PRETRAIN_ITER,
+        load_mean_step=PRETRAIN_ITER + MI_OPT_ITER - 1,
+    ),
+    optimizers={
+        "proposal_networks": {
+            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=0.1, max_value=0.1),
+            "scheduler": ExponentialDecayStepSchedulerConfig(lr_final=1e-4, max_steps=20000,
+                                                             step_pretrain=PRETRAIN_ITER, lr_lambda=.01),
+        },
+        "fields": {
+            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15, max_norm=0.1, max_value=0.1),
+            "scheduler": ExponentialDecayStepSchedulerConfig(lr_final=1e-4, max_steps=20000,
+                                                             step_pretrain=PRETRAIN_ITER, lr_lambda=.01),
+        },
+    },
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15, quit_on_train_completion=True),
+    vis="viewer",
+)
+
+method_configs["sdf-gt-envmap"] = TrainerConfig(
+    method_name="sdf-gt-envmap",
+    steps_per_eval_batch=5,
+    steps_per_save=10,
+    max_num_iterations=MI_OPT_ITER,
+    mixed_precision=False,
+    write_mi_model_outputs=True,
+    pipeline=MitsubaSdfPipelineConfig(
+        datamanager=MitsubaDataManagerConfig(
+            _target=MitsubaDataManager[OcclusionDataset],
+            dataparser=NerfstudioDataParserConfig(),
+            train_num_rays_per_batch=4096,
+            eval_num_rays_per_batch=4096,
+            camera_optimizer=CameraOptimizerConfig(
+                mode="off",
+                optimizer=RAdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-3),
+            ),
+            pre_mult_mask=True,
+            pixel_sampler=PixelSamplerConfig(
+                masked_sampling=False,
+            ),
+            images_on_gpu=True,
+        ),
+        model=DummyModelConfig(),
+        takeover_step=0,
+        load_mean_step=MI_OPT_ITER - 1,
+        guiding_type='env',
+        hide_emitters=True,
+    ),
+    optimizers={},
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15, quit_on_train_completion=True),
+    logging=LoggingConfig(steps_per_log=1),
     vis="viewer",
 )
 
@@ -301,7 +444,6 @@ method_configs["instant-ngp"] = TrainerConfig(
     vis="viewer",
 )
 
-
 method_configs["instant-ngp-bounded"] = TrainerConfig(
     method_name="instant-ngp-bounded",
     steps_per_eval_batch=500,
@@ -329,7 +471,6 @@ method_configs["instant-ngp-bounded"] = TrainerConfig(
     viewer=ViewerConfig(num_rays_per_chunk=1 << 12),
     vis="viewer",
 )
-
 
 method_configs["mipnerf"] = TrainerConfig(
     method_name="mipnerf",

@@ -15,7 +15,9 @@
 """
 A pipeline that dynamically chooses the number of rays to sample.
 """
+from __future__ import annotations
 
+import pathlib
 from dataclasses import dataclass, field
 from typing import Literal, Type, Optional
 
@@ -52,8 +54,9 @@ class DynamicBatchPipeline(VanillaPipeline):
         world_size: int = 1,
         local_rank: int = 0,
         grad_scaler: Optional[GradScaler] = None,
+        mixed_precision: bool = False,
     ):
-        super().__init__(config, device, test_mode, world_size, local_rank)
+        super().__init__(config, device, test_mode, world_size, local_rank, grad_scaler, mixed_precision)
         assert isinstance(
             self.datamanager, VanillaDataManager
         ), "DynamicBatchPipeline only works with VanillaDataManager."
@@ -75,7 +78,7 @@ class DynamicBatchPipeline(VanillaPipeline):
             self.dynamic_num_rays_per_batch * (self.config.target_num_samples / num_samples_per_batch)
         )
 
-    def get_train_loss_dict(self, step: int):
+    def get_train_loss_dict(self, step: int, model_output_dir: pathlib.Path | None = None):
         model_outputs, loss_dict, metrics_dict = super().get_train_loss_dict(step)
 
         # update the number of rays for the next step

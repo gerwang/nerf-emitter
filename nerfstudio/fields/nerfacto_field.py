@@ -16,14 +16,13 @@
 Field for compound nerf model, adds scene contraction and image embeddings to instant ngp
 """
 
-
 from typing import Dict, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
 
 from nerfstudio.cameras.rays import RaySamples
-from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.data.scene_box import SceneBox, aabb_contain
 from nerfstudio.field_components.activations import trunc_exp
 from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.encodings import HashEncoding, NeRFEncoding, SHEncoding
@@ -33,11 +32,29 @@ from nerfstudio.field_components.field_heads import (
     SemanticFieldHead,
     TransientDensityFieldHead,
     TransientRGBFieldHead,
-    UncertaintyFieldHead,
-)
+    UncertaintyFieldHead, )
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
-from nerfstudio.fields.base_field import Field, shift_directions_for_tcnn
+from nerfstudio.fields.base_field import Field, get_normalized_directions
+
+SAFE_EXP_MAX = 88.
+
+
+class SafeExp(nn.Module):
+    r"""Applies the element-wise function:
+
+
+    Shape:
+        - Input: :math:`(*)`, where :math:`*` means any number of dimensions.
+        - Output: :math:`(*)`, same shape as the input.
+    """
+
+    def __init__(self, bias):
+        super().__init__()
+        self.bias = bias
+
+    def forward(self, input: Tensor) -> Tensor:
+        return torch.exp(torch.clamp(input + self.bias, max=SAFE_EXP_MAX))  # safe_exp
 
 
 class NerfactoField(Field):
@@ -50,10 +67,12 @@ class NerfactoField(Field):
         hidden_dim: dimension of hidden layers
         geo_feat_dim: output geo feat dimensions
         num_levels: number of levels of the hashmap for the base mlp
+        base_res: base resolution of the hashmap for the base mlp
         max_res: maximum resolution of the hashmap for the base mlp
         log2_hashmap_size: size of the hashmap for the base mlp
         num_layers_color: number of hidden layers for color network
         num_layers_transient: number of hidden layers for transient network
+        features_per_level: number of features per level for the hashgrid
         hidden_dim_color: dimension of hidden layers for color network
         hidden_dim_transient: dimension of hidden layers for transient network
         appearance_embedding_dim: dimension of appearance embedding
@@ -94,6 +113,9 @@ class NerfactoField(Field):
         use_average_appearance_embedding: bool = False,
         spatial_distortion: Optional[SpatialDistortion] = None,
         implementation: Literal["tcnn", "torch"] = "tcnn",
+        color_output_activation: Literal['Sigmoid', 'RawNeRF'] = 'Sigmoid',
+        rgb_bias: float = -5,
+        always_use_camera_indices: bool = False,
     ) -> None:
         super().__init__()
 
@@ -107,13 +129,15 @@ class NerfactoField(Field):
         self.spatial_distortion = spatial_distortion
         self.num_images = num_images
         self.appearance_embedding_dim = appearance_embedding_dim
-        self.embedding_appearance = Embedding(self.num_images, self.appearance_embedding_dim)
-        self.use_average_appearance_embedding = use_average_appearance_embedding
+        if self.appearance_embedding_dim > 0:
+            self.embedding_appearance = Embedding(self.num_images, self.appearance_embedding_dim)
+            self.use_average_appearance_embedding = use_average_appearance_embedding
         self.use_transient_embedding = use_transient_embedding
         self.use_semantics = use_semantics
         self.use_pred_normals = use_pred_normals
         self.pass_semantic_gradients = pass_semantic_gradients
         self.base_res = base_res
+        self.always_use_camera_indices = always_use_camera_indices
 
         self.direction_encoding = SHEncoding(
             levels=4,
@@ -194,25 +218,32 @@ class NerfactoField(Field):
             layer_width=hidden_dim_color,
             out_dim=3,
             activation=nn.ReLU(),
-            out_activation=nn.Sigmoid(),
+            out_activation={'Sigmoid': nn.Sigmoid(),
+                            'RawNeRF': SafeExp(bias=rgb_bias)}[color_output_activation],
             implementation=implementation,
         )
 
+        self.disable_inside_aabb = False
+
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
         """Computes and returns the densities."""
+        original_positions = ray_samples.frustums.get_positions()
         if self.spatial_distortion is not None:
-            positions = ray_samples.frustums.get_positions()
+            positions = original_positions
             positions = self.spatial_distortion(positions)
             positions = (positions + 2.0) / 4.0
         else:
-            positions = SceneBox.get_normalized_positions(ray_samples.frustums.get_positions(), self.aabb)
+            positions = SceneBox.get_normalized_positions(original_positions, self.aabb)
         # Make sure the tcnn gets inputs between 0 and 1.
         selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1)
+        if self.disable_inside_aabb:
+            selector &= ~aabb_contain(self.aabb, original_positions)
         positions = positions * selector[..., None]
         self._sample_locations = positions
         if not self._sample_locations.requires_grad:
             self._sample_locations.requires_grad = True
         positions_flat = positions.view(-1, 3)
+
         h = self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1)
         density_before_activation, base_mlp_out = torch.split(h, [1, self.geo_feat_dim], dim=-1)
         self._density_before_activation = density_before_activation
@@ -225,31 +256,33 @@ class NerfactoField(Field):
         return density, base_mlp_out
 
     def get_outputs(
-        self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None
+            self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None
     ) -> Dict[FieldHeadNames, Tensor]:
         assert density_embedding is not None
         outputs = {}
         if ray_samples.camera_indices is None:
             raise AttributeError("Camera indices are not provided.")
         camera_indices = ray_samples.camera_indices.squeeze()
-        directions = shift_directions_for_tcnn(ray_samples.frustums.directions)
+        directions = get_normalized_directions(ray_samples.frustums.directions)
         directions_flat = directions.view(-1, 3)
         d = self.direction_encoding(directions_flat)
 
         outputs_shape = ray_samples.frustums.directions.shape[:-1]
 
         # appearance
-        if self.training:
-            embedded_appearance = self.embedding_appearance(camera_indices)
-        else:
-            if self.use_average_appearance_embedding:
-                embedded_appearance = torch.ones(
-                    (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
-                ) * self.embedding_appearance.mean(dim=0)
+        embedded_appearance = None
+        if self.appearance_embedding_dim > 0:
+            if self.training or self.always_use_camera_indices:
+                embedded_appearance = self.embedding_appearance(camera_indices)
             else:
-                embedded_appearance = torch.zeros(
-                    (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
-                )
+                if self.use_average_appearance_embedding:
+                    embedded_appearance = torch.ones(
+                        (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
+                    ) * self.embedding_appearance.mean(dim=0)
+                else:
+                    embedded_appearance = torch.zeros(
+                        (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
+                    )
 
         # transients
         if self.use_transient_embedding and self.training:
@@ -285,15 +318,17 @@ class NerfactoField(Field):
             x = self.mlp_pred_normals(pred_normals_inp).view(*outputs_shape, -1).to(directions)
             outputs[FieldHeadNames.PRED_NORMALS] = self.field_head_pred_normals(x)
 
-        h = torch.cat(
-            [
-                d,
-                density_embedding.view(-1, self.geo_feat_dim),
-                embedded_appearance.view(-1, self.appearance_embedding_dim),
-            ],
-            dim=-1,
-        )
+        embedding_list = [
+            d,
+            density_embedding.view(-1, self.geo_feat_dim),
+        ]
+        if self.appearance_embedding_dim > 0:
+            embedding_list.append(embedded_appearance.view(-1, self.appearance_embedding_dim))
+        h = torch.cat(embedding_list, dim=-1)
+
         rgb = self.mlp_head(h).view(*outputs_shape, -1).to(directions)
+        if self.mlp_head._rgb_before_activation is not None:
+            self._rgb_before_activation = self.mlp_head._rgb_before_activation.view(*ray_samples.frustums.shape, -1)
         outputs.update({FieldHeadNames.RGB: rgb})
 
         return outputs

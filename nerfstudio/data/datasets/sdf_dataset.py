@@ -36,16 +36,20 @@ class SDFDataset(InputDataset):
 
     exclude_batch_keys_from_device = InputDataset.exclude_batch_keys_from_device + ["depth", "normal"]
 
-    def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0):
-        super().__init__(dataparser_outputs, scale_factor)
+    def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0, pre_mult_mask: bool = False):
+        super().__init__(dataparser_outputs, scale_factor, pre_mult_mask)
 
         # can be none if monoprior not included
-        self.depth_filenames = self.metadata["depth_filenames"]
-        self.normal_filenames = self.metadata["normal_filenames"]
-        self.camera_to_worlds = self.metadata["camera_to_worlds"]
+        self.depth_filenames = self.metadata.get("depth_filenames", None)
+        self.normal_filenames = self.metadata.get("normal_filenames", None)
+        self.camera_to_worlds = self.metadata.get("camera_to_worlds", None)
+        self.include_mono_prior = self.metadata.get("include_mono_prior", False)
+        if self.include_mono_prior:
+            assert self.depth_filenames is not None
+            assert self.normal_filenames is not None
+            assert self.camera_to_worlds is not None
         # can be none if auto orient not enabled in dataparser
-        self.transform = self.metadata["transform"]
-        self.include_mono_prior = self.metadata["include_mono_prior"]
+        self.transform = self.metadata.get("transform", None)
 
     def get_metadata(self, data: Dict) -> Dict:
         # TODO supports foreground_masks

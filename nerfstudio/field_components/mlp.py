@@ -34,12 +34,13 @@ except ModuleNotFoundError:
     TCNN_EXISTS = False
 
 
-def activation_to_tcnn_string(activation: Union[nn.Module, None]) -> str:
+def activation_to_tcnn_string(activation: Union[nn.Module, None], is_output_activation=False) -> str:
     """Converts a torch.nn activation function to a string that can be used to
     initialize a TCNN activation function.
 
     Args:
         activation: torch.nn activation function
+        is_output_activation: If is output activation, allow an extra invocation in pytorch
     Returns:
         str: TCNN activation function string
     """
@@ -56,6 +57,8 @@ def activation_to_tcnn_string(activation: Union[nn.Module, None]) -> str:
         return "Tanh"
     if isinstance(activation, type(None)):
         return "None"
+    if is_output_activation:
+        return "ExtraOutput"
     tcnn_documentation_url = "https://github.com/NVlabs/tiny-cuda-nn/blob/master/DOCUMENTATION.md#activation-functions"
     raise ValueError(
         f"TCNN activation {activation} not supported for now.\nSee {tcnn_documentation_url} for TCNN documentation."
@@ -95,16 +98,22 @@ class MLP(FieldComponent):
         self._skip_connections: Set[int] = set(skip_connections) if skip_connections else set()
         self.activation = activation
         self.out_activation = out_activation
+        self.do_extra_out_activation = False
         self.net = None
+        self._rgb_before_activation = None
 
         self.tcnn_encoding = None
         if implementation == "torch":
             self.build_nn_modules()
         elif implementation == "tcnn" and not TCNN_EXISTS:
             print_tcnn_speed_warning("MLP")
+            self.build_nn_modules()
         elif implementation == "tcnn":
             activation_str = activation_to_tcnn_string(activation)
-            output_activation_str = activation_to_tcnn_string(out_activation)
+            output_activation_str = activation_to_tcnn_string(out_activation, is_output_activation=True)
+            if output_activation_str == 'ExtraOutput':
+                output_activation_str = 'None'
+                self.do_extra_out_activation = True
             if layer_width in [16, 32, 64, 128]:
                 network_config = {
                     "otype": "FullyFusedMLP",
@@ -168,11 +177,16 @@ class MLP(FieldComponent):
             x = layer(x)
             if self.activation is not None and i < len(self.layers) - 1:
                 x = self.activation(x)
+        self._rgb_before_activation = x
         if self.out_activation is not None:
             x = self.out_activation(x)
         return x
 
     def forward(self, in_tensor: Float[Tensor, "*bs in_dim"]) -> Float[Tensor, "*bs out_dim"]:
         if self.tcnn_encoding is not None:
-            return self.tcnn_encoding(in_tensor)
+            res = self.tcnn_encoding(in_tensor)
+            if self.do_extra_out_activation:
+                self._rgb_before_activation = res
+                res = self.out_activation(res)
+            return res
         return self.pytorch_fwd(in_tensor)

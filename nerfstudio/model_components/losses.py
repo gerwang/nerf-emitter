@@ -42,6 +42,11 @@ class DepthLossType(Enum):
 
     DS_NERF = 1
     URF = 2
+    SPARSENERF_RANKING = 3
+
+
+FORCE_PSEUDODEPTH_LOSS = False
+PSEUDODEPTH_COMPATIBLE_LOSSES = (DepthLossType.SPARSENERF_RANKING,)
 
 
 def outer(
@@ -205,6 +210,15 @@ def orientation_loss(
     v = viewdirs * -1
     n_dot_v = (n * v[..., None, :]).sum(dim=-1)
     return (w[..., 0] * torch.fmin(torch.zeros_like(n_dot_v), n_dot_v) ** 2).sum(dim=-1)
+
+
+def pred_gradient_loss(
+    weights: Float[Tensor, "*bs num_samples 1"],
+    gradients: Float[Tensor, "*bs num_samples 3"],
+    pred_gradients: Float[Tensor, "*bs num_samples 3"],
+):
+    """Loss between gradients calculated from auto differentiation and gradients from prediction network."""
+    return torch.nn.functional.l1_loss(gradients * weights, pred_gradients * weights)
 
 
 def pred_normal_loss(
@@ -561,3 +575,52 @@ def scale_gradients_by_distance_squared(
     for key, value in field_outputs.items():
         out[key], _ = cast(Tuple[Tensor, Tensor], _GradientScaler.apply(value, scaling))
     return out
+
+
+class RawNeRFLoss(torch.nn.MSELoss):
+    def __init__(self, size_average=None, reduce=None, reduction: str = 'mean', eps=1e-3) -> None:
+        super().__init__(size_average, reduce, reduction)
+        self.eps = eps
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # Scale by gradient of log tonemapping curve.
+        scaling_grad = 1. / (self.eps + input.detach())
+        # Reweighted L2 loss.
+        return super().forward(input * scaling_grad, target * scaling_grad)
+
+
+class RelativeL1Loss(torch.nn.L1Loss):
+    def __init__(self, size_average=None, reduce=None, reduction: str = 'mean', eps=1e-3) -> None:
+        super().__init__(size_average, reduce, reduction)
+        self.eps = eps
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # Scale by gradient of log tonemapping curve.
+        scaling_grad = 1. / (self.eps + input.detach())
+        # Reweighted L1 loss.
+        return super().forward(input * scaling_grad, target * scaling_grad)
+
+
+class RelativeMaxL1Loss(torch.nn.L1Loss):
+    def __init__(self, size_average=None, reduce=None, reduction: str = 'mean', eps=1e-3) -> None:
+        super().__init__(size_average, reduce, reduction)
+        self.eps = eps
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # Scale by gradient of log tonemapping curve.
+        scaling_grad = 1. / (self.eps + torch.maximum(input.detach(), target))
+        # Reweighted L1 loss.
+        return super().forward(input * scaling_grad, target * scaling_grad)
+
+
+def depth_ranking_loss(rendered_depth, gt_depth):
+    """
+    Depth ranking loss as described in the SparseNeRF paper
+    Assumes that the layout of the batch comes from a PairPixelSampler, so that adjacent samples in the gt_depth
+    and rendered_depth are from pixels with a radius of each other
+    """
+    m = 1e-4
+    dpt_diff = gt_depth[::2, :] - gt_depth[1::2, :]
+    out_diff = rendered_depth[::2, :] - rendered_depth[1::2, :] + m
+    differing_signs = torch.sign(dpt_diff) != torch.sign(out_diff)
+    return torch.nanmean((out_diff[differing_signs] * torch.sign(out_diff[differing_signs])))

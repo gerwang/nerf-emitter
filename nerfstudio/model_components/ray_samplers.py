@@ -40,6 +40,10 @@ class Sampler(nn.Module):
     ) -> None:
         super().__init__()
         self.num_samples = num_samples
+        self.generator_dict = {}
+
+    def get_generator(self, device: torch.device):
+        return self.generator_dict.setdefault(device, torch.Generator(device=device))
 
     @abstractmethod
     def generate_ray_samples(self) -> Any:
@@ -102,9 +106,11 @@ class SpacedSampler(Sampler):
         # TODO More complicated than it needs to be.
         if self.train_stratified and self.training:
             if self.single_jitter:
-                t_rand = torch.rand((num_rays, 1), dtype=bins.dtype, device=bins.device)
+                t_rand = torch.rand((num_rays, 1), dtype=bins.dtype, device=bins.device,
+                                    generator=self.get_generator(bins.device))
             else:
-                t_rand = torch.rand((num_rays, num_samples + 1), dtype=bins.dtype, device=bins.device)
+                t_rand = torch.rand((num_rays, num_samples + 1), dtype=bins.dtype, device=bins.device,
+                                    generator=self.get_generator(bins.device))
             bin_centers = (bins[..., 1:] + bins[..., :-1]) / 2.0
             bin_upper = torch.cat([bin_centers, bins[..., -1:]], -1)
             bin_lower = torch.cat([bins[..., :1], bin_centers], -1)
@@ -319,9 +325,11 @@ class PDFSampler(Sampler):
             u = torch.linspace(0.0, 1.0 - (1.0 / num_bins), steps=num_bins, device=cdf.device)
             u = u.expand(size=(*cdf.shape[:-1], num_bins))
             if self.single_jitter:
-                rand = torch.rand((*cdf.shape[:-1], 1), device=cdf.device) / num_bins
+                rand = torch.rand((*cdf.shape[:-1], 1), device=cdf.device,
+                                  generator=self.get_generator(cdf.device)) / num_bins
             else:
-                rand = torch.rand((*cdf.shape[:-1], num_samples + 1), device=cdf.device) / num_bins
+                rand = torch.rand((*cdf.shape[:-1], num_samples + 1), device=cdf.device,
+                                  generator=self.get_generator(cdf.device)) / num_bins
             u = u + rand
         else:
             # Uniform samples between 0 and 1
@@ -505,14 +513,13 @@ class VolumetricSampler(Sampler):
         if camera_indices is not None:
             camera_indices = camera_indices[ray_indices]
 
-        zeros = torch.zeros_like(origins[:, :1])
         ray_samples = RaySamples(
             frustums=Frustums(
                 origins=origins,
                 directions=dirs,
                 starts=starts[..., None],
                 ends=ends[..., None],
-                pixel_area=zeros,
+                pixel_area=ray_bundle[ray_indices].pixel_area,
             ),
             camera_indices=camera_indices,
         )
@@ -541,6 +548,7 @@ class ProposalNetworkSampler(Sampler):
         single_jitter: bool = False,
         update_sched: Callable = lambda x: 1,
         initial_sampler: Optional[Sampler] = None,
+        train_stratified: bool = True,
     ) -> None:
         super().__init__()
         self.num_proposal_samples_per_ray = num_proposal_samples_per_ray
@@ -552,10 +560,13 @@ class ProposalNetworkSampler(Sampler):
 
         # samplers
         if initial_sampler is None:
-            self.initial_sampler = UniformLinDispPiecewiseSampler(single_jitter=single_jitter)
+            self.initial_sampler = UniformLinDispPiecewiseSampler(single_jitter=single_jitter,
+                                                                  train_stratified=train_stratified)
         else:
             self.initial_sampler = initial_sampler
-        self.pdf_sampler = PDFSampler(include_original=False, single_jitter=single_jitter)
+        self.pdf_samplers = nn.ModuleList([PDFSampler(include_original=False, single_jitter=single_jitter,
+                                                      train_stratified=train_stratified)
+                                           for _ in range(num_proposal_network_iterations)])
 
         self._anneal = 1.0
         self._steps_since_update = 0
@@ -596,7 +607,8 @@ class ProposalNetworkSampler(Sampler):
                 # Perform annealing to the weights. This will be a no-op if self._anneal is 1.0.
                 assert weights is not None
                 annealed_weights = torch.pow(weights, self._anneal)
-                ray_samples = self.pdf_sampler(ray_bundle, ray_samples, annealed_weights, num_samples=num_samples)
+                ray_samples = self.pdf_samplers[i_level - 1](ray_bundle, ray_samples, annealed_weights,
+                                                             num_samples=num_samples)
             if is_prop:
                 if updated:
                     # always update on the first step or the inf check in grad scaling crashes

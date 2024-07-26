@@ -32,7 +32,14 @@ class _TruncExp(Function):
     @custom_fwd(cast_inputs=torch.float32)
     def forward(ctx, x):
         ctx.save_for_backward(x)
+        ctx.save_for_forward(x)
         return torch.exp(x)
+
+    @staticmethod
+    @custom_bwd
+    def jvp(ctx, gx):
+        x = ctx.saved_tensors[0]
+        return torch.exp(x.clamp(-15, 15)) * gx
 
     @staticmethod
     @custom_bwd

@@ -18,13 +18,37 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import matplotlib
+import numpy as np
 import torch
 from jaxtyping import Bool, Float
+from matplotlib.colors import ListedColormap
 from torch import Tensor
 
 from nerfstudio.utils import colors
 
-Colormaps = Literal["default", "turbo", "viridis", "magma", "inferno", "cividis", "gray", "pca"]
+
+def srgb_to_linear(img):
+    limit = 0.04045
+    return np.where(img > limit, ((img + 0.055) / 1.055) ** 2.4, img / 12.92)
+
+
+def linear_to_srgb(img):
+    limit = 0.0031308
+    img = np.where(img > limit, 1.055 * img ** (1 / 2.4) - 0.055, 12.92 * img)
+    img[img > 1] = 1  # "clamp" tonemapper
+    return img
+
+
+def linear_to_srgb_torch(img):
+    limit = 0.0031308
+    img = torch.where(img > limit, 1.055 * img ** (1 / 2.4) - 0.055, 12.92 * img)
+    img[img > 1] = 1  # "clamp" tonemapper
+    return img
+
+
+Colormaps = Literal["default", "turbo", "viridis", "magma", "inferno", "cividis", "gray", "pca", "cubicl"]
+matplotlib.colormaps.register(
+    ListedColormap(np.loadtxt('differentiable-sdf-rendering/assets/CubicL.txt').tolist()), name='cubicl')
 
 
 @dataclass(frozen=True)
@@ -41,6 +65,10 @@ class ColormapOptions:
     """ Maximum value for the output colormap """
     invert: bool = False
     """ Whether to invert the output colormap """
+    tone_mapping: bool = False
+    """ Whether to perform linear to sRGB tone mapping """
+    is_mask: bool = False
+    """ Whether to output internal masks"""
 
 
 def apply_colormap(
@@ -64,17 +92,30 @@ def apply_colormap(
 
     # default for rgb images
     if image.shape[-1] == 3:
+        if colormap_options.tone_mapping:
+            image = linear_to_srgb_torch(image)
         return image
 
-    # rendering depth outputs
+    # default for outputting internal masks
+    if colormap_options.is_mask:
+        image = image.clamp(min=0, max=1)
+        return image
+
     if image.shape[-1] == 1 and torch.is_floating_point(image):
         output = image
-        if colormap_options.normalize:
-            output = output - torch.min(output)
-            output = output / (torch.max(output) + eps)
-        output = (
-            output * (colormap_options.colormap_max - colormap_options.colormap_min) + colormap_options.colormap_min
-        )
+        if colormap_options.colormap == 'cubicl':
+            # rendering gradient outputs
+            if colormap_options.normalize:
+                output = torch.sign(output) * torch.log1p(torch.abs(output))
+            output = output / colormap_options.colormap_max * 0.5 + 0.5
+        else:
+            # rendering depth outputs
+            if colormap_options.normalize:
+                output = output - torch.min(output)
+                output = output / (torch.max(output) + eps)
+            output = (
+                output * (colormap_options.colormap_max - colormap_options.colormap_min) + colormap_options.colormap_min
+            )
         output = torch.clip(output, 0, 1)
         if colormap_options.invert:
             output = 1 - output
@@ -106,12 +147,13 @@ def apply_float_colormap(image: Float[Tensor, "*bs 1"], colormap: Colormaps = "v
     image = torch.nan_to_num(image, 0)
     if colormap == "gray":
         return image.repeat(1, 1, 3)
-    image_long = (image * 255).long()
+    map_colors = matplotlib.colormaps[colormap].colors
+    image_long = (image * (len(map_colors) - 1)).long()
     image_long_min = torch.min(image_long)
     image_long_max = torch.max(image_long)
     assert image_long_min >= 0, f"the min value is {image_long_min}"
-    assert image_long_max <= 255, f"the max value is {image_long_max}"
-    return torch.tensor(matplotlib.colormaps[colormap].colors, device=image.device)[image_long[..., 0]]
+    assert image_long_max <= len(map_colors) - 1, f"the max value is {image_long_max}"
+    return torch.tensor(map_colors, device=image.device)[image_long[..., 0]]
 
 
 def apply_depth_colormap(

@@ -44,6 +44,7 @@ class Field(nn.Module):
         super().__init__()
         self._sample_locations = None
         self._density_before_activation = None
+        self._rgb_before_activation = None
 
     def density_fn(
         self, positions: Shaped[Tensor, "*bs 3"], times: Optional[Shaped[Tensor, "*bs 1"]] = None
@@ -77,8 +78,8 @@ class Field(nn.Module):
             ray_samples: Samples locations to compute density.
         """
 
-    def get_normals(self) -> Float[Tensor, "*batch 3"]:
-        """Computes and returns a tensor of normals.
+    def get_density_gradients(self) -> Float[Tensor, "*batch 3"]:
+        """Computes and returns a tensor of density gradients.
 
         Args:
             density: Tensor of densities.
@@ -95,7 +96,16 @@ class Field(nn.Module):
             grad_outputs=torch.ones_like(self._density_before_activation),
             retain_graph=True,
         )[0]
+        return normals
 
+    def get_normals(self) -> Float[Tensor, "*batch 3"]:
+        """Computes and returns a tensor of normals.
+
+        Args:
+            density: Tensor of densities.
+        """
+
+        normals = self.get_density_gradients()
         normals = -torch.nn.functional.normalize(normals, dim=-1)
 
         return normals
@@ -133,8 +143,8 @@ class Field(nn.Module):
         return field_outputs
 
 
-def shift_directions_for_tcnn(directions: Float[Tensor, "*bs 3"]) -> Float[Tensor, "*bs 3"]:
-    """Shift directions from [-1, 1] to [0, 1]
+def get_normalized_directions(directions: Float[Tensor, "*bs 3"]) -> Float[Tensor, "*bs 3"]:
+    """SH encoding must be in the range [0, 1]
 
     Args:
         directions: batch of directions

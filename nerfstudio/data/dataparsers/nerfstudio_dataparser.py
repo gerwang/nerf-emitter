@@ -15,24 +15,27 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional, Type
 
 import numpy as np
 import torch
-from PIL import Image
+from trimesh.transformations import decompose_matrix
 
 from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras, CameraType
-from nerfstudio.data.dataparsers.base_dataparser import (
-    DataParser,
-    DataParserConfig,
-    DataparserOutputs,
-)
+from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.data.utils.dataparsers_utils import (
+    get_train_eval_split_filename,
+    get_train_eval_split_fraction,
+    get_train_eval_split_interval,
+    get_train_eval_split_all,
+)
 from nerfstudio.utils.io import load_from_json
+from nerfstudio.utils.mi_gl_conversion import batch_affine_left
+from nerfstudio.utils.poses import to4x4
 from nerfstudio.utils.rich_utils import CONSOLE
 
 MAX_AUTO_RESOLUTION = 1600
@@ -46,23 +49,46 @@ class NerfstudioDataParserConfig(DataParserConfig):
     """target class to instantiate"""
     data: Path = Path()
     """Directory or explicit json file path specifying location of data."""
+    mi_data: Optional[Path] = None
+    """Directory or explicit json file path specifying location of data for Mitsuba training, default to same as data"""
     scale_factor: float = 1.0
     """How much to scale the camera origins by."""
     downscale_factor: Optional[int] = None
     """How much to downscale images. If not set, images are chosen such that the max dimension is <1600px."""
     scene_scale: float = 1.0
     """How much to scale the region of interest by."""
-    orientation_method: Literal["pca", "up", "vertical", "none"] = "up"
+    orientation_method: Literal["pca", "up", "vertical", "none"] = "none"
     """The method to use for orientation."""
-    center_method: Literal["poses", "focus", "none"] = "poses"
+    center_method: Literal["poses", "focus", "none"] = "none"
     """The method to use to center the poses."""
     auto_scale_poses: bool = True
     """Whether to automatically scale the poses to fit in +/- 1 bounding box."""
+    eval_mode: Literal["fraction", "filename", "interval", "all"] = "fraction"
+    """
+    The method to use for splitting the dataset into train and eval. 
+    Fraction splits based on a percentage for train and the remaining for eval.
+    Filename splits based on filenames containing train/eval.
+    Interval uses every nth frame for eval.
+    All uses all the images for any split.
+    """
     train_split_fraction: float = 0.9
-    """The fraction of images to use for training. The remaining images are for eval."""
+    """The percentage of the dataset to use for training. Only used when eval_mode is train-split-fraction."""
+    eval_interval: int = 8
+    """The interval between frames to use for eval. Only used when eval_mode is eval-interval."""
     depth_unit_scale_factor: float = 1e-3
     """Scales the depth values to meters. Default value is 0.001 for a millimeter to meter conversion."""
-
+    to_linear: bool = False
+    """Whether it performs sRGB to Linear to mock HDR training data"""
+    filter_rotation: Optional[float] = None
+    """Whether filter only one rotation"""
+    tone_mapping: bool = False
+    """Whether doing tone mapping to convert HDR to sRGB"""
+    mock_split_by_valid: bool = False
+    """Mock the split indices by valid, set valid to False instead of removing the indice"""
+    mock_filter_rotation_by_valid: bool = False
+    """Mock the filter rotation by valid, set valid to False instead of removing the indice"""
+    shift_rotation: float = 0.
+    """Minus rotation by this value, ignore the one that below zero, currently used for dark_sheep"""
 
 @dataclass
 class Nerfstudio(DataParser):
@@ -72,14 +98,24 @@ class Nerfstudio(DataParser):
     downscale_factor: Optional[int] = None
 
     def _generate_dataparser_outputs(self, split="train"):
-        assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
+        data_path = self.config.data
+        old_downscale_factor = None
+        recover_downscale_factor = False
+        if split.startswith('mi_'):
+            old_downscale_factor = self.downscale_factor
+            recover_downscale_factor = True
+            self.downscale_factor = 1  # Always use full resolution
+            split = split[len('mi_'):]
+            if self.config.mi_data is not None:
+                data_path = self.config.mi_data
+        assert data_path.exists(), f"Data directory {data_path} does not exist."
 
-        if self.config.data.suffix == ".json":
-            meta = load_from_json(self.config.data)
-            data_dir = self.config.data.parent
+        if data_path.suffix == ".json":
+            meta = load_from_json(data_path)
+            data_dir = data_path.parent
         else:
-            meta = load_from_json(self.config.data / "transforms.json")
-            data_dir = self.config.data
+            meta = load_from_json(data_path / "transforms.json")
+            data_dir = data_path
 
         image_filenames = []
         mask_filenames = []
@@ -105,9 +141,39 @@ class Nerfstudio(DataParser):
         width = []
         distort = []
 
+        # sort the frames by fname
+        fnames = []
         for frame in meta["frames"]:
             filepath = Path(frame["file_path"])
             fname = self._get_fname(filepath, data_dir)
+            fnames.append(fname)
+        inds = np.argsort(fnames)
+        frames = [meta["frames"][ind] for ind in inds]
+        rotations = []
+        valids = []
+
+        for frame in frames:
+            filepath = Path(frame["file_path"])
+            fname = self._get_fname(filepath, data_dir)
+
+            if 'rotation' in frame:
+                rotation = float(frame['rotation'])
+                if self.config.shift_rotation > 0:
+                    rotation -= self.config.shift_rotation
+                    if rotation < 0:
+                        continue
+                if self.config.filter_rotation is not None:
+                    if rotation != self.config.filter_rotation:
+                        if self.config.mock_filter_rotation_by_valid:
+                            if 'valid' in frame:
+                                frame['valid'] = False
+                        else:
+                            continue
+                rotations.append(rotation)
+
+            if 'valid' in frame:
+                valid = bool(frame['valid'])
+                valids.append(valid)
 
             if not fx_fixed:
                 assert "fl_x" in frame, "fx not specified in frame"
@@ -155,6 +221,9 @@ class Nerfstudio(DataParser):
                 depth_fname = self._get_fname(depth_filepath, data_dir, downsample_folder_prefix="depths_")
                 depth_filenames.append(depth_fname)
 
+        if self.config.mock_filter_rotation_by_valid and len(valids) > 0:
+            CONSOLE.log(f'Enabled mock_filter_rotation_by_valid, total valid count: {sum(valids)}')
+
         assert len(mask_filenames) == 0 or (
             len(mask_filenames) == len(image_filenames)
         ), """
@@ -182,16 +251,21 @@ class Nerfstudio(DataParser):
         elif has_split_files_spec:
             raise RuntimeError(f"The dataset's list of filenames for split {split} is missing.")
         else:
-            # filter image_filenames and poses based on train/eval split percentage
-            num_images = len(image_filenames)
-            num_train_images = math.ceil(num_images * self.config.train_split_fraction)
-            num_eval_images = num_images - num_train_images
-            i_all = np.arange(num_images)
-            i_train = np.linspace(
-                0, num_images - 1, num_train_images, dtype=int
-            )  # equally spaced training images starting and ending at 0 and num_images-1
-            i_eval = np.setdiff1d(i_all, i_train)  # eval images are the remaining images
-            assert len(i_eval) == num_eval_images
+            # find train and eval indices based on the eval_mode specified
+            if self.config.eval_mode == "fraction":
+                i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
+            elif self.config.eval_mode == "filename":
+                i_train, i_eval = get_train_eval_split_filename(image_filenames)
+            elif self.config.eval_mode == "interval":
+                i_train, i_eval = get_train_eval_split_interval(image_filenames, self.config.eval_interval)
+            elif self.config.eval_mode == "all":
+                CONSOLE.log(
+                    "[yellow] Be careful with '--eval-mode=all'. If using camera optimization, the cameras may diverge in the current implementation, giving unpredictable results."
+                )
+                i_train, i_eval = get_train_eval_split_all(image_filenames)
+            else:
+                raise ValueError(f"Unknown eval mode {self.config.eval_mode}")
+
             if split == "train":
                 indices = i_train
             elif split in ["val", "test"]:
@@ -199,6 +273,9 @@ class Nerfstudio(DataParser):
             else:
                 raise ValueError(f"Unknown dataparser split {split}")
 
+            if self.config.mock_split_by_valid:
+                valids = [valids[i] and i in indices for i in range(len(valids))]
+                indices, _ = get_train_eval_split_all(image_filenames)
         if "orientation_override" in meta:
             orientation_method = meta["orientation_override"]
             CONSOLE.log(f"[yellow] Dataset is overriding orientation method to {orientation_method}")
@@ -230,7 +307,8 @@ class Nerfstudio(DataParser):
 
         # in x,y,z order
         # assumes that the scene is centered at the origin
-        aabb_scale = self.config.scene_scale
+        # aabb_scale = self.config.scene_scale
+        aabb_scale = 1.0 * scale_factor
         scene_box = SceneBox(
             aabb=torch.tensor(
                 [[-aabb_scale, -aabb_scale, -aabb_scale], [aabb_scale, aabb_scale, aabb_scale]], dtype=torch.float32
@@ -284,6 +362,38 @@ class Nerfstudio(DataParser):
             applied_scale = float(meta["applied_scale"])
             scale_factor *= applied_scale
 
+        metadata = {
+            "depth_filenames": depth_filenames if len(depth_filenames) > 0 else None,
+            "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
+        }
+        if len(rotations) > 0:
+            rotations = [rotations[x] for x in indices]
+            assert len(rotations) == len(image_filenames)
+            metadata['rotations'] = rotations
+        if 'rotations' in meta:
+            scale_diagonal = torch.tensor([scale_factor, scale_factor, scale_factor, 1.0], dtype=torch.float32)
+            scale_matrix = torch.diag(scale_diagonal) @ to4x4(transform_matrix)
+            inv_scale_matrix = torch.linalg.inv(scale_matrix)
+            rotation_transform_matrices = {}
+            for k, v in meta['rotations'].items():
+                k = float(k)
+                v = np.array(v)
+                scale, _, _, _, _ = decompose_matrix(v)
+                if np.any(scale < 0.99) or np.any(scale > 1.01):
+                    CONSOLE.log(f'Too much scale for a rotation transformation {v.tolist()}')
+                v[:3, :3] /= scale  # completely remove the scale component
+                v = torch.from_numpy(v).float()
+                v = scale_matrix @ v @ inv_scale_matrix
+                rotation_transform_matrices[k] = torch.linalg.inv(v)  # observation to canonical
+            metadata['rotation_transform_matrices'] = rotation_transform_matrices
+            if 'rotation_aabb' in meta:
+                rotation_aabb = torch.tensor(meta['rotation_aabb'], dtype=torch.float32)  # [2, 3]
+                rotation_aabb = batch_affine_left(scale_matrix, rotation_aabb)
+                metadata['rotation_aabb'] = rotation_aabb
+        if len(valids) > 0:
+            valids = [valids[x] for x in indices]
+            assert len(valids) == len(image_filenames)
+            metadata['valid_mask'] = valids
         dataparser_outputs = DataparserOutputs(
             image_filenames=image_filenames,
             cameras=cameras,
@@ -291,11 +401,13 @@ class Nerfstudio(DataParser):
             mask_filenames=mask_filenames if len(mask_filenames) > 0 else None,
             dataparser_scale=scale_factor,
             dataparser_transform=transform_matrix,
-            metadata={
-                "depth_filenames": depth_filenames if len(depth_filenames) > 0 else None,
-                "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
-            },
+            metadata=metadata,
+            is_hdr=image_filenames[0].suffix in ['.exr', '.hdr'],
+            to_linear=self.config.to_linear,
+            tone_mapping=self.config.tone_mapping,
         )
+        if recover_downscale_factor:
+            self.downscale_factor = old_downscale_factor
         return dataparser_outputs
 
     def _get_fname(self, filepath: Path, data_dir: Path, downsample_folder_prefix="images_") -> Path:
@@ -309,8 +421,10 @@ class Nerfstudio(DataParser):
 
         if self.downscale_factor is None:
             if self.config.downscale_factor is None:
-                test_img = Image.open(data_dir / filepath)
-                h, w = test_img.size
+                import mitsuba as mi
+                mi.set_variant('scalar_rgb')
+                test_img = np.asarray(mi.Bitmap(str(data_dir / filepath)))
+                h, w = test_img.shape[:2]
                 max_res = max(h, w)
                 df = 0
                 while True:

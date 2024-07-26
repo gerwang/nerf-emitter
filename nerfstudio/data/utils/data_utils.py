@@ -20,18 +20,25 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+from skimage.transform import resize
 
 
 def get_image_mask_tensor_from_path(filepath: Path, scale_factor: float = 1.0) -> torch.Tensor:
     """
     Utility function to read a mask image from the given path and return a boolean tensor
     """
-    pil_mask = Image.open(filepath)
+    import mitsuba as mi
+    if mi.variant() is None:
+        mi.set_variant('scalar_rgb')
+    np_mask = np.asarray(mi.Bitmap(str(filepath)))
+    np_mask = np_mask.astype(np.float32) / np.iinfo(np_mask.dtype).max
     if scale_factor != 1.0:
-        width, height = pil_mask.size
+        height, width = np_mask.shape[:2]
         newsize = (int(width * scale_factor), int(height * scale_factor))
-        pil_mask = pil_mask.resize(newsize, resample=Image.NEAREST)
-    mask_tensor = torch.from_numpy(np.array(pil_mask)).unsqueeze(-1).bool()
+        np_mask = resize(np_mask, newsize, order=1, mode='reflect', anti_aliasing=True)
+    mask_tensor = torch.from_numpy(np_mask).unsqueeze(-1).float()
+    if len(mask_tensor.shape) == 4:
+        mask_tensor = mask_tensor[..., 0, :]
     if len(mask_tensor.shape) != 3:
         raise ValueError("The mask image should have 1 channel")
     return mask_tensor

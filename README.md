@@ -47,6 +47,40 @@ conda deactivate
 conda activate nerfemitter
 ```
 
+## Running Experiments
+
+Download the dataset from the [release](https://github.com/gerwang/nerf-emitter/releases) page and unzip to the project directory.
+
+Please refer to the `scripts/` directory for running the training, mesh export, novel-view synthesis and relighting.
+
+### Synthetic dataset
+
+```bash
+bash scripts/synthetic/ours/run_${object}.sh
+```
+
+#### Environment map baseline
+
+
+```bash
+bash scripts/synthetic/baseline/run_${object}.sh
+```
+
+### Real dataset
+
+#### Our method
+
+```bash
+bash scripts/real/ours/run_${object}.sh
+```
+
+#### Environment map baseline
+
+
+```bash
+bash scripts/real/baseline/run_${object}.sh
+```
+
 ## Project Structure
 
 - `differentiable-sdf-rendering/` contains our modified version of the differentiable SDF rendering code
@@ -92,3 +126,7 @@ conda activate nerfemitter
   - `scripts/`
     - `render.py` renders novel-view and relighted images
     - `train.py` is the training script
+
+# Acknowledgement
+
+This project is based on [nerfstudio](https://github.com/nerfstudio-project/nerfstudio) and [differentiable-sdf-rendering](https://github.com/rgl-epfl/differentiable-sdf-rendering). Thanks for these great projects.

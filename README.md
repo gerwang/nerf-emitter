@@ -1,8 +1,8 @@
 # NeRF as a Non-Distant Environment Emitter in Physics-based Inverse Rendering
 
-![papers_232s3](https://github.com/user-attachments/assets/596658f5-e7d9-4dc8-abb8-d166c3c6b2c5)
-
 ### [Project Page](https://nerfemitterpbir.github.io/) | [Paper](https://arxiv.org/abs/2402.04829) | [Dataset](https://github.com/gerwang/nerf-emitter/releases)
+
+![papers_232s3](https://github.com/user-attachments/assets/596658f5-e7d9-4dc8-abb8-d166c3c6b2c5)
 
 ## Installation: Setup the environment
 
